@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Darkwood">
+<meta name="theme-color" content="#000000">
+<title>Darkwood — Arena of Champions</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    touch-action: none; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    background: #000 radial-gradient(ellipse at 50% 40%, #0d0a14 0%, #000 70%);
+  }
+  #wrap {
+    position: fixed; inset: 0;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    display: flex; align-items: center; justify-content: center;
+    box-sizing: border-box;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    box-shadow: 0 0 0 1px #111, 0 0 40px #000;
+  }
+  noscript { color: #ddc; font: 16px monospace; padding: 20px; display: block; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="screen" aria-label="Darkwood game screen"></canvas></div>
+<noscript>Darkwood needs JavaScript to run.</noscript>
+<!--SCRIPTS-->
+</body>
+</html>
