@@ -1728,6 +1728,1187 @@ var DW = window.DW = window.DW || {};
 
 </script>
 <script>
+// ---- 07_audio.js ----
+// ================================================================
+// AUDIO — every sound and every note is synthesised here with the
+// Web Audio API. There are no audio files.
+//
+//   DW.audio.unlock()           first user gesture: create/resume the context
+//   DW.audio.sfx(name, opts)    fire-and-forget effect, opts {pitch, vol}
+//   DW.audio.music(name|null)   switch track with a short fade, or stop
+//   DW.audio.setMusic(on) / setSfx(on), .musicOn / .sfxOn (persisted)
+//
+// Music is written like an early-90s Amiga MOD: a handful of channels
+// (lead, bass, arpeggio/chords, drums) playing "sampled" instruments.
+// The samples are rendered in JS on first use (Karplus-Strong lute and
+// harp, additive bells, synthetic drums) and replayed at any pitch the
+// way Paula did; the rest are small oscillator patches. Songs are stored
+// as compact text patterns (see SONGS) and played by a look-ahead
+// scheduler. Everything is a silent no-op before unlock() or when Web
+// Audio is missing, and no call ever throws.
+// ================================================================
+(() => {
+  'use strict';
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const AU = DW.audio = { musicOn: true, sfxOn: true };
+  const KEY = 'darkwood_audio';
+  const AHEAD = 0.1, TICK_MS = 25, FADE = 0.35;
+  const TAU = Math.PI * 2;
+
+  try {
+    const s = JSON.parse(localStorage.getItem(KEY) || '{}') || {};
+    if (s.music === false) AU.musicOn = false;
+    if (s.sfx === false) AU.sfxOn = false;
+  } catch (_) { /* storage blocked: keep defaults */ }
+  const saveSettings = () => {
+    try { localStorage.setItem(KEY, JSON.stringify({ music: AU.musicOn, sfx: AU.sfxOn })); } catch (_) { /* ignore */ }
+  };
+
+  // Small seeded RNG so rendered samples are identical on every load.
+  const rng = seed => {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const jitter = () => 1 + (Math.random() * 2 - 1) * 0.04;
+
+  // ---------------------------------------------------------------
+  // Engine: master chain + rendered sample bank, built per context
+  // (the live one, or an OfflineAudioContext for testing).
+  // ---------------------------------------------------------------
+  function makeEngine(c) {
+    const E = { ctx: c, sr: c.sampleRate, ks: new Map() };
+    E.nyq = E.sr * 0.45;
+    // master: buses -> compressor -> warm lowpass (Paula-ish) -> soft clip
+    const comp = c.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 4;
+    comp.attack.value = 0.004; comp.release.value = 0.22;
+    const lp = c.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = Math.min(9500, E.nyq); lp.Q.value = 0.5;
+    const clip = c.createWaveShaper();
+    const cv = new Float32Array(2049);
+    for (let i = 0; i < cv.length; i++) {
+      const x = i / 1024 - 1, a = Math.abs(x);
+      cv[i] = Math.sign(x) * (a < 0.7 ? a : 0.7 + 0.28 * Math.tanh((a - 0.7) / 0.28));
+    }
+    clip.curve = cv;
+    E.master = c.createGain();
+    E.master.connect(comp); comp.connect(lp); lp.connect(clip); clip.connect(c.destination);
+    E.out = clip;
+    E.musicBus = gain(c, 0.32); E.musicBus.connect(E.master);
+    E.sfxBus = gain(c, 0.6); E.sfxBus.connect(E.master);
+
+    // crunch curve for crits
+    const cr = new Float32Array(1025);
+    for (let i = 0; i < cr.length; i++) { const x = i / 512 - 1; cr[i] = Math.tanh(x * 4) / Math.tanh(4); }
+    E.crunch = cr;
+
+    E.noise = mkBuf(c, 2, d => { const r = rng(7); for (let i = 0; i < d.length; i++) d[i] = r() * 2 - 1; }, true);
+    E.drum = makeDrums(c);
+    E.bell = makeBell(c);
+    E.waves = {
+      organ: wave(c, [0, 0.55, 1, 0.3, 0.7, 0, 0.4, 0, 0.45, 0, 0.12, 0, 0.2, 0, 0, 0, 0.15]),
+      flute: wave(c, [0, 1, 0.32, 0.1, 0.04, 0.02]),
+    };
+    return E;
+  }
+
+  function gain(c, v) { const g = c.createGain(); g.gain.value = v; return g; }
+  function wave(c, amps) {
+    const re = new Float32Array(amps.length), im = new Float32Array(amps);
+    return c.createPeriodicWave(re, im);
+  }
+  function panner(c, p) {
+    if (c.createStereoPanner) { const n = c.createStereoPanner(); n.pan.value = p || 0; return n; }
+    return gain(c, 1);
+  }
+  function filt(E, type, f, q) {
+    const n = E.ctx.createBiquadFilter();
+    n.type = type; n.frequency.value = Math.min(f, E.nyq); n.Q.value = q == null ? 0.7 : q;
+    return n;
+  }
+
+  // Render a mono buffer with fn(data, sampleRate, length); edges get a
+  // tiny fade so a sample can never start or stop with a click.
+  function mkBuf(c, dur, fn, raw) {
+    const sr = c.sampleRate, n = Math.max(2, Math.floor(sr * dur));
+    const b = c.createBuffer(1, n, sr), d = b.getChannelData(0);
+    fn(d, sr, n);
+    if (!raw) {
+      const fi = Math.min(n, Math.floor(sr * 0.0006)), fo = Math.min(n, Math.floor(sr * 0.008));
+      for (let i = 0; i < fi; i++) d[i] *= i / fi;
+      for (let i = 0; i < fo; i++) d[n - 1 - i] *= i / fo;
+    }
+    return b;
+  }
+  const hpCoef = (fc, sr) => { const rc = 1 / (TAU * fc); return rc / (rc + 1 / sr); };
+  // 808-style metallic source: six detuned square waves
+  const metal = t => {
+    let s = 0;
+    for (const f of [507, 734, 887, 1255, 1296, 1920]) s += Math.sin(TAU * f * t) > 0 ? 1 : -1;
+    return s / 6;
+  };
+  function hiss(d, sr, n, seed, fc, mix, env) {
+    const r = rng(seed), a = hpCoef(fc, sr);
+    let x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr, w = (r() * 2 - 1) * (1 - mix) + metal(t) * mix;
+      const y = a * (y1 + w - x1); x1 = w; y1 = y;          // two one-pole highpasses
+      const z = a * (y2 + y - x2); x2 = y; y2 = z;
+      d[i] = z * env(t);
+    }
+  }
+
+  function makeDrums(c) {
+    const D = {};
+    D.kick = mkBuf(c, 0.5, (d, sr, n) => {
+      const r = rng(11); let ph = 0, lp = 0;
+      for (let i = 0; i < n; i++) {
+        const t = i / sr, f = 44 + 115 * Math.exp(-t / 0.032) + 60 * Math.exp(-t / 0.004);
+        ph += TAU * f / sr;
+        let s = Math.sin(ph) * Math.exp(-t / 0.17);
+        if (t < 0.005) { lp += (r() * 2 - 1 - lp) * 0.35; s += lp * 0.6 * (1 - t / 0.005); }
+        d[i] = Math.tanh(s * 1.7) * 0.92;
+      }
+    });
+    D.snare = mkBuf(c, 0.32, (d, sr, n) => {
+      const r = rng(12), a = hpCoef(900, sr); let x1 = 0, y1 = 0, p1 = 0, p2 = 0;
+      for (let i = 0; i < n; i++) {
+        const t = i / sr, w = r() * 2 - 1, y = a * (y1 + w - x1); x1 = w; y1 = y;
+        p1 += TAU * 185 * (1 + 0.35 * Math.exp(-t / 0.012)) / sr; p2 += TAU * 330 / sr;
+        d[i] = (Math.sin(p1) * 0.55 * Math.exp(-t / 0.05) + Math.sin(p2) * 0.22 * Math.exp(-t / 0.028) +
+          y * 0.9 * Math.exp(-t / 0.075)) * 0.85;
+      }
+    });
+    D.hat = mkBuf(c, 0.09, (d, sr, n) => hiss(d, sr, n, 13, 6500, 0.35, t => Math.exp(-t / 0.018) * 1.4));
+    D.ohat = mkBuf(c, 0.5, (d, sr, n) => hiss(d, sr, n, 14, 6000, 0.35, t => Math.exp(-t / 0.13) * 1.2));
+    D.crash = mkBuf(c, 2.2, (d, sr, n) => hiss(d, sr, n, 15, 3200, 0.3, t => Math.min(1, t / 0.003) * Math.exp(-t / 0.55) * 1.1));
+    D.shaker = mkBuf(c, 0.14, (d, sr, n) => hiss(d, sr, n, 16, 5000, 0, t => Math.min(1, t / 0.008) * Math.exp(-t / 0.035) * 1.2));
+    D.tom = mkBuf(c, 0.6, (d, sr, n) => {   // base pitch 110 Hz, re-pitched by rate
+      const r = rng(17); let ph = 0;
+      for (let i = 0; i < n; i++) {
+        const t = i / sr; ph += TAU * 110 * (1 + 0.5 * Math.exp(-t / 0.04)) / sr;
+        d[i] = (Math.sin(ph) * Math.exp(-t / 0.2) + (r() * 2 - 1) * 0.15 * Math.exp(-t / 0.01)) * 0.9;
+      }
+    });
+    D.timp = mkBuf(c, 1.8, (d, sr, n) => {  // base pitch 98 Hz (G2)
+      const r = rng(18), P = [[1, 1, 0.9], [1.504, 0.45, 0.5], [1.742, 0.28, 0.4], [1.99, 0.22, 0.3]];
+      const ph = [0, 0, 0, 0]; let lp = 0;
+      for (let i = 0; i < n; i++) {
+        const t = i / sr, gl = 1 + 0.04 * Math.exp(-t / 0.05); let s = 0;
+        for (let k = 0; k < 4; k++) { ph[k] += TAU * 98 * P[k][0] * gl / sr; s += Math.sin(ph[k]) * P[k][1] * Math.exp(-t / P[k][2]); }
+        lp += (r() * 2 - 1 - lp) * 0.08;
+        d[i] = (s * 0.55 + lp * 1.2 * Math.exp(-t / 0.012)) * Math.min(1, t / 0.002);
+      }
+    });
+    return D;
+  }
+
+  function makeBell(c) {   // additive church-bell partials at a base of 440 Hz
+    const P = [[0.5, 0.25, 2.4], [1, 1, 2.0], [1.2, 0.35, 1.4], [1.5, 0.28, 1.2], [2, 0.45, 1.0],
+      [2.51, 0.2, 0.7], [3.01, 0.14, 0.5], [4.17, 0.09, 0.35], [5.43, 0.05, 0.25]];
+    return mkBuf(c, 3, (d, sr, n) => {
+      let pk = 0;
+      for (let i = 0; i < n; i++) {
+        const t = i / sr; let s = 0;
+        for (const [r, a, k] of P) s += Math.sin(TAU * 440 * r * t) * a * Math.exp(-t / k);
+        d[i] = s * Math.min(1, t / 0.002); pk = Math.max(pk, Math.abs(d[i]));
+      }
+      for (let i = 0; i < n; i++) d[i] *= 0.8 / pk;
+    });
+  }
+
+  // Karplus-Strong plucked strings, one buffer per (kind, note), made on
+  // first use and cached. Averaging taps N and N-1 makes the loop N - 0.5
+  // samples long; the leftover fraction is fixed with playbackRate.
+  const KS = {
+    harp: { b: 0.75, t60: 2.6, len: 2.2, pick: 0 },
+    lute: { b: 0.4, t60: 1.4, len: 1.4, pick: 0.19 },
+    kbass: { b: 0.28, t60: 1.6, len: 1.4, pick: 0.12 },
+  };
+  function ksSample(E, kind, m) {
+    const key = kind + m;
+    let s = E.ks.get(key);
+    if (s) return s;
+    const P = KS[kind], sr = E.sr, f = hz(m);
+    const N = Math.max(4, Math.round(sr / f + 0.5)), rate = f / (sr / (N - 0.5));
+    const len = Math.floor(sr * P.len);
+    const b = E.ctx.createBuffer(1, len, sr), d = b.getChannelData(0);
+    const r = rng(m * 31 + kind.length), ring = new Float32Array(N);
+    let lp = 0, mean = 0;
+    for (let i = 0; i < N; i++) { lp += (r() * 2 - 1 - lp) * P.b; ring[i] = lp; }
+    if (P.pick) {
+      const k = Math.max(1, Math.round(N * P.pick)), tmp = ring.slice();
+      for (let i = 0; i < N; i++) ring[i] = tmp[i] - tmp[(i - k + N) % N];
+    }
+    for (let i = 0; i < N; i++) mean += ring[i];
+    mean /= N;
+    for (let i = 0; i < N; i++) ring[i] -= mean;
+    const g = Math.pow(0.001, 1 / (f * P.t60));
+    let idx = 0, pk = 1e-9;
+    for (let i = 0; i < len; i++) {
+      const a = ring[idx], nx = idx + 1 === N ? 0 : idx + 1;
+      d[i] = a; ring[idx] = g * 0.5 * (a + ring[nx]); idx = nx;
+      if (a > pk) pk = a; else if (-a > pk) pk = -a;
+    }
+    const sc = 0.8 / pk, fo = Math.floor(sr * 0.03);
+    for (let i = 0; i < len; i++) d[i] *= sc * (i > len - fo ? (len - i) / fo : 1);
+    s = { b, rate };
+    E.ks.set(key, s);
+    return s;
+  }
+
+  // Short synth notes rendered once per pitch in JS (band-limited saw /
+  // square -> resonant state-variable lowpass with a decaying cutoff), then
+  // replayed as samples. Far cheaper than live filter automation per note.
+  //   osc: [wave, cents, level, bypassFilter]   ff: [startMul, endMul, seconds]
+  const SAMP = {
+    bass: { len: 1.7, a: 0.004, tc: 0.075, s: 0.55, ff: [12, 2.6, 0.1], q: 5, osc: [['saw', 0, 0.5], ['tri', 0, 0.35, 1]] },
+    spluck: { len: 0.32, a: 0.002, tc: 0.03, s: 0.12, ff: [8, 1.6, 0.12], q: 2, osc: [['sq', 0, 0.3]] },
+    stab: { len: 0.45, a: 0.004, tc: 0.0375, s: 0.35, ff: [9, 2, 0.16], q: 2, osc: [['saw', -9, 0.3], ['saw', 9, 0.3]] },
+  };
+  const blep = (t, dt) => {
+    if (t < dt) { t /= dt; return t + t - t * t - 1; }
+    if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+    return 0;
+  };
+  function synthSample(E, kind, m) {
+    const key = '~' + kind + m;
+    let b = E.ks.get(key);
+    if (b) return b;
+    const P = SAMP[kind], sr = E.sr, f = hz(m), n = Math.floor(sr * P.len);
+    b = E.ctx.createBuffer(1, n, sr);
+    const d = b.getChannelData(0), ph = P.osc.map(() => 0), dts = P.osc.map(o => f * Math.pow(2, o[1] / 1200) / sr);
+    const k = 1 / P.q, fLo = f * P.ff[1], fHi = f * P.ff[0];
+    let ic1 = 0, ic2 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      if ((i & 15) === 0) {
+        const fc = Math.min(sr * 0.45, t < P.ff[2] ? fHi * Math.pow(fLo / fHi, t / P.ff[2]) : fLo);
+        const g = Math.tan(Math.PI * fc / sr);
+        a1 = 1 / (1 + g * (g + k)); a2 = g * a1; a3 = g * a2;
+      }
+      let x = 0, dry = 0;
+      for (let j = 0; j < P.osc.length; j++) {
+        const o = P.osc[j], p = ph[j], dt = dts[j];
+        let v;
+        if (o[0] === 'saw') v = 2 * p - 1 - blep(p, dt);
+        else if (o[0] === 'sq') v = (p < 0.5 ? 1 : -1) + blep(p, dt) - blep((p + 0.5) % 1, dt);
+        else v = 4 * Math.abs(p - 0.5) - 1;
+        if (o[3]) dry += v * o[2]; else x += v * o[2];
+        ph[j] = p + dt >= 1 ? p + dt - 1 : p + dt;
+      }
+      const v3 = x - ic2, v1 = a1 * ic1 + a2 * v3, v2 = ic2 + a2 * ic1 + a3 * v3;
+      ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2;
+      const env = t < P.a ? t / P.a : P.s + (1 - P.s) * Math.exp(-(t - P.a) / P.tc);
+      d[i] = (v2 + dry) * env;
+    }
+    const fo = Math.floor(sr * 0.02);
+    for (let i = 0; i < fo; i++) d[n - 1 - i] *= i / fo;
+    E.ks.set(key, b);
+    return b;
+  }
+
+  // ---------------------------------------------------------------
+  // Envelope + voice helpers. Every gain starts and ends at exactly
+  // zero via ramps, so nothing clicks.
+  // ---------------------------------------------------------------
+  function adsr(p, t, dur, a, d, s, r, pk) {
+    const rel = t + Math.max(dur, a + 0.002);
+    p.setValueAtTime(0, t);
+    p.linearRampToValueAtTime(pk, t + a);
+    let lv = pk;
+    if (s < 1 && d > 0) {
+      const sv = pk * s, tc = d / 4;
+      p.setTargetAtTime(sv, t + a, tc);
+      lv = sv + (pk - sv) * Math.exp(-(rel - t - a) / tc);
+    }
+    p.setValueAtTime(lv, rel);
+    p.linearRampToValueAtTime(0, rel + r);
+    return rel + r;
+  }
+  function perc(p, t, a, pk, d) {
+    p.setValueAtTime(0, t);
+    p.linearRampToValueAtTime(pk, t + a);
+    p.exponentialRampToValueAtTime(pk * 0.001 + 1e-6, t + a + d);
+    p.linearRampToValueAtTime(0, t + a + d + 0.01);
+    return t + a + d + 0.012;
+  }
+  // Frequency path: [f0, [f1, dt1], [f2, dt2], ...] with exponential ramps.
+  function path(E, p, t, pts) {
+    p.setValueAtTime(Math.min(pts[0], E.nyq), t);
+    for (let i = 1; i < pts.length; i++) p.exponentialRampToValueAtTime(Math.max(10, Math.min(pts[i][0], E.nyq)), t + pts[i][1]);
+  }
+
+  // Sustained oscillator voice for the music: o = {type|w, f, det[], fl:[type,q,...path],
+  // pk:[freq,gainDb,q], a,d,s,r, v, vib:[rate, cents, delay]}
+  function syn(V, t, dur, o) {
+    const E = V.E, c = E.ctx, amp = c.createGain(), oscs = [];
+    amp.gain.value = 0;
+    const end = adsr(amp.gain, t, dur, o.a, o.d, o.s, o.r, o.v);
+    let head = amp;
+    if (o.fl) {
+      const f = c.createBiquadFilter();
+      f.type = o.fl[0]; f.Q.value = o.fl[1];
+      path(E, f.frequency, t, o.fl.slice(2));
+      f.connect(head); head = f;
+    }
+    amp.connect(o.ins ? insert(V, o.ins) : V.dest);
+    for (const det of o.det || [0]) {
+      const os = c.createOscillator();
+      if (o.w) os.setPeriodicWave(E.waves[o.w]); else os.type = o.type || 'sawtooth';
+      os.frequency.value = o.f; os.detune.value = det;
+      os.connect(head); os.start(t); os.stop(end + 0.02);
+      oscs.push(os);
+    }
+    if (o.vib && dur > o.vib[2] + 0.1) {
+      const l = c.createOscillator(), lg = c.createGain();
+      l.frequency.value = o.vib[0];
+      lg.gain.setValueAtTime(0, t); lg.gain.setValueAtTime(0, t + o.vib[2]);
+      lg.gain.linearRampToValueAtTime(o.vib[1], t + o.vib[2] + 0.3);
+      l.connect(lg);
+      for (const os of oscs) lg.connect(os.detune);
+      l.start(t); l.stop(end + 0.02); oscs.push(l);
+    }
+    for (const os of oscs) V.track(os, end + 0.02);
+    return end;
+  }
+
+  // Static per-instrument filters live once per channel (like a tracker
+  // channel effect) instead of once per note.
+  const INSERT = {
+    choir: [['lowpass', 1500, 0.6], ['peaking', 800, 1.4, 8]],
+    strings: [['lowpass', 1700, 0.6]],
+    organ: [['lowpass', 5200, 0.7]],
+    dbass: [['lowpass', 650, 0.7]],
+  };
+  function insert(V, name) {
+    const ins = V.ins || (V.ins = {});
+    if (ins[name]) return ins[name];
+    let head = V.dest;
+    const chain = INSERT[name] || [];
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const [type, f, q, g] = chain[i], b = filt(V.E, type, f, q);
+      if (g) b.gain.value = g;
+      b.connect(head); head = b;
+    }
+    return (ins[name] = head);
+  }
+
+  // Replay a rendered synth sample, gated to the note length.
+  function sampled(V, t, m, kind, v, dur, rel) {
+    const c = V.E.ctx, b = synthSample(V.E, kind, m), src = c.createBufferSource(), g = c.createGain();
+    src.buffer = b;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t + 0.002);
+    let end = t + b.duration;
+    if (dur + rel < b.duration - 0.02) {
+      g.gain.setValueAtTime(v, t + Math.max(dur, 0.003));
+      end = t + Math.max(dur, 0.003) + rel;
+      g.gain.linearRampToValueAtTime(0, end);
+    }
+    src.connect(g); g.connect(V.dest);
+    src.start(t); src.stop(end + 0.01);
+    V.track(src, end + 0.01);
+  }
+
+  function pluck(V, t, m, kind, v, ring) {
+    const E = V.E, c = E.ctx, s = ksSample(E, kind, m), src = c.createBufferSource(), g = c.createGain();
+    src.buffer = s.b; src.playbackRate.value = s.rate;
+    const nat = s.b.duration / s.rate;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t + 0.003);
+    let end = t + nat;
+    if (ring < nat - 0.12) {
+      const rt = t + Math.max(ring, 0.03);
+      g.gain.setValueAtTime(v, rt); g.gain.linearRampToValueAtTime(0, rt + 0.1);
+      end = rt + 0.1;
+    }
+    src.connect(g); g.connect(V.dest);
+    src.start(t); src.stop(end + 0.01);
+    V.track(src, end + 0.01);
+  }
+
+  function bellNote(V, t, f, v, ring) {
+    const E = V.E, c = E.ctx, src = c.createBufferSource(), g = c.createGain(), rate = f / 440;
+    src.buffer = E.bell; src.playbackRate.value = rate;
+    const nat = E.bell.duration / rate;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t + 0.002);
+    let end = t + nat;
+    if (ring < nat - 0.3) { g.gain.setValueAtTime(v, t + ring); g.gain.linearRampToValueAtTime(0, t + ring + 0.3); end = t + ring + 0.3; }
+    src.connect(g); g.connect(V.dest);
+    src.start(t); src.stop(end + 0.01);
+    V.track(src, end + 0.01);
+  }
+
+  function hitBuf(E, dest, t, name, v, rate) {
+    const c = E.ctx, s = c.createBufferSource(), g = gain(c, v);
+    s.buffer = E.drum[name];
+    if (rate) s.playbackRate.value = rate;
+    s.connect(g); g.connect(dest); s.start(t);
+  }
+  // Drum hit on a music channel: hits of equal level share one gain node.
+  function drumHit(V, t, name, v, rate) {
+    const c = V.E.ctx, ins = V.ins || (V.ins = {}), key = 'v' + v;
+    if (!ins[key]) { ins[key] = gain(c, v); ins[key].connect(V.dest); }
+    const s = c.createBufferSource();
+    s.buffer = V.E.drum[name];
+    if (rate) s.playbackRate.value = rate;
+    s.connect(ins[key]); s.start(t);
+    V.track(s, t + s.buffer.duration / (rate || 1));
+  }
+
+  // ---------------------------------------------------------------
+  // Instruments: (V, time, midi, seconds, velocity)
+  // ---------------------------------------------------------------
+  const INST = {
+    harp: (V, t, m, d, v) => pluck(V, t, m, 'harp', v, d + 1.8),
+    lute: (V, t, m, d, v) => pluck(V, t, m, 'lute', v, d + 0.35),
+    kbass: (V, t, m, d, v) => pluck(V, t, m, 'kbass', v, d + 0.08),
+    bell: (V, t, m, d, v) => bellNote(V, t, hz(m), v * 0.8, Math.max(d, 2)),
+    flute: (V, t, m, d, v) => {
+      const f = hz(m);
+      syn(V, t, d, { w: 'flute', f, a: 0.045, d: 0.25, s: 0.8, r: 0.14, v: v * 0.55, vib: [5.2, 14, 0.25] });
+      syn(V, t, Math.min(d, 0.06), { type: 'sawtooth', f: f * 1.5, fl: ['bandpass', 2, f * 3], a: 0.01, d: 0.05, s: 0, r: 0.04, v: v * 0.05 });
+    },
+    saw: (V, t, m, d, v) => {
+      const f = hz(m);
+      syn(V, t, d, { type: 'sawtooth', det: [-8, 8], f, fl: ['lowpass', 1.3, f * 10, [Math.min(f * 4, 3600), 0.2]], a: 0.006, d: 0.3, s: 0.7, r: 0.1, v: v * 0.32, vib: [5.8, 16, 0.2] });
+    },
+    organ: (V, t, m, d, v) => syn(V, t, d, { w: 'organ', det: [-4, 4], f: hz(m) / 2, ins: 'organ', a: 0.01, d: 0.15, s: 0.85, r: 0.09, v: v * 0.32, vib: [6.4, 9, 0.05] }),
+    brass: (V, t, m, d, v) => {
+      const f = hz(m);
+      syn(V, t, d, { type: 'sawtooth', det: [-7, 7], f, fl: ['lowpass', 1.6, f * 1.2, [f * 7, 0.07], [f * 3.5, 0.4]], a: 0.025, d: 0.3, s: 0.75, r: 0.12, v: v * 0.38, vib: [5.5, 12, 0.3] });
+    },
+    stab: (V, t, m, d, v) => sampled(V, t, m, 'stab', v, Math.min(d, 0.16), 0.08),
+    spluck: (V, t, m, d, v) => sampled(V, t, m, 'spluck', v, Math.min(d, 0.12), 0.06),
+    bass: (V, t, m, d, v) => sampled(V, t, m, 'bass', v, d, 0.05),
+    dbass: (V, t, m, d, v) => syn(V, t, d, { type: 'triangle', f: hz(m), ins: 'dbass', a: 0.02, d: 0.6, s: 0.7, r: 0.3, v: v * 0.38 }),
+    strings: (V, t, m, d, v) => syn(V, t, d, { type: 'sawtooth', det: [-9, 9], f: hz(m), ins: 'strings', a: 0.4, d: 0.8, s: 0.85, r: 0.7, v: v * 0.22 }),
+    choir: (V, t, m, d, v) => syn(V, t, d, { type: 'sawtooth', det: [-11, 11], f: hz(m), ins: 'choir', a: 0.6, d: 1.0, s: 0.9, r: 1.0, v: v * 0.17 }),
+  };
+
+  // ---------------------------------------------------------------
+  // SONGS. One step is a 16th note. Per channel:
+  //   pad   holds each chord, voiced inside one octave from `lo`
+  //   arp   one char per step: digit = rung of the chord ladder, c = whole
+  //         chord stab, - = stop, . = let ring
+  //   bass  one char per step: 1 3 5 7 8 = chord degree (0 = octave below)
+  //   drum  k kick, s snare, g ghost, h/H hat, o open hat, c crash+kick,
+  //         C crash, t m l toms, x kick+snare, b shaker, K/S = with hat,
+  //         T timpani on the chord root
+  //   mel   NOTE:steps or r:steps; @inst switches instrument
+  // `p` holds named patterns/phrases and `o` lists them in play order.
+  // ---------------------------------------------------------------
+  const SONGS = {
+    // Haunting D minor: harp arpeggios over a slow choir, a lone flute.
+    title: {
+      bpm: 72, bars: 24,
+      chords: 'Dm Bb Gm A  Dm Am Bb F Gm Dm Bb A  Bb C Am Dm Gm Bb Asus4 A  Dm Bb Gm:8 Asus4:8 A',
+      ch: [
+        { k: 'pad', i: 'choir', lo: 57, v: 0.7 },
+        { k: 'arp', i: 'harp', lo: 50, v: 0.6, pan: -0.3, p: { a: '0123432101234321', b: '0124542101245421' }, o: 'aaaa aaaaaaaa bbbbbbbb aaaa' },
+        { k: 'bass', i: 'dbass', lo: 38, v: 0.8, p: { a: '1...............', b: '1.......5.......' }, o: 'aaaa aaaaaaaa bbbbbbbb aaaa' },
+        { k: 'drum', v: 0.55, p: { q: '................', p: 'T...............', h: 'k..k............', f: 'k..k....l...l.l.' }, o: 'qqqq pqpqpqpq hhhhhhhf pqpq' },
+        { k: 'mel', i: 'flute', v: 0.6, pan: 0.15, o: 'zabcde', p: {
+          z: 'r:64',
+          a: 'A4:4 D5:4 F5:6 E5:2  E5:8 r:2 C5:2 D5:2 E5:2  F5:6 D5:2 Bb4:8  C5:4 A4:4 F4:8',
+          b: 'G4:4 Bb4:4 D5:4 G5:4  F5:6 E5:2 D5:8  D5:4 C5:2 Bb4:2 F5:4 D5:4  E5:8 C#5:4 A4:4',
+          c: 'F5:4 Bb5:4 A5:4 F5:4  G5:6 E5:2 C5:8  E5:4 A5:4 G5:4 E5:4  F5:8 E5:4 D5:4',
+          d: 'G5:6 F5:2 D5:4 Bb4:4  D5:6 F5:2 Bb5:8  A5:6 G5:2 F5:4 E5:4  E5:4 D5:2 C#5:2 A4:8',
+          e: '@bell A5:8 D6:8  F5:16  Bb5:8 D5:8  C#5:8 r:8',
+        } },
+      ],
+    },
+    // Calm A dorian jig in 6/8: lute picking, tabor, recorder and harp.
+    town: {
+      bpm: 96, bar: 12, bars: 24,
+      chords: 'Am D Am G  Am D G Am  C G D Em  C G Bm D  Am D Am G  Am D G Am',
+      ch: [
+        { k: 'pad', i: 'strings', lo: 55, v: 0.5 },
+        { k: 'arp', i: 'lute', lo: 52, v: 0.65, pan: -0.35, p: { a: '0.1.2.3.2.1.', b: '0.2.3.2.1.2.' }, o: 'ab' },
+        { k: 'bass', i: 'kbass', lo: 40, v: 0.9, p: { a: '1.....5.....', b: '1.....3.5...' }, o: 'aaab' },
+        { k: 'drum', v: 0.35, p: { a: 'k...b.t...b.', b: 'k...b.t.b.tt' }, o: 'aaab' },
+        { k: 'mel', i: 'flute', v: 0.62, pan: 0.2, o: 'xyuvxy', p: {
+          x: 'A4:4 B4:2 C5:4 D5:2  E5:4 F#5:2 E5:4 D5:2  C5:4 B4:2 A4:4 B4:2  G4:6 B4:4 D5:2',
+          y: 'A4:4 B4:2 C5:4 E5:2  A5:4 F#5:2 E5:4 D5:2  B4:4 D5:2 G5:4 F#5:2  E5:4 C5:2 A4:6',
+          u: '@harp G5:4 E5:2 C5:4 E5:2  D5:4 B4:2 G4:4 B4:2  A4:4 D5:2 F#5:4 A5:2  G5:4 F#5:2 E5:6',
+          v: '@harp E5:4 F#5:2 G5:4 A5:2  B5:4 A5:2 G5:4 D5:2  F#5:4 E5:2 D5:4 B4:2  A4:4 B4:2 C5:4 D5:2',
+        } },
+      ],
+    },
+    // Driving E minor: octave bass, chip arps, saw lead.
+    battle: {
+      bpm: 140, bars: 32,
+      chords: 'Em Em C D  Em Em C D Em Em Am B  C D Bm Em C D B B  Em Em C D Em Em Am B  Em C Am B',
+      ch: [
+        { k: 'pad', i: 'strings', lo: 52, v: 0.45 },
+        { k: 'arp', i: 'spluck', lo: 64, v: 0.5, pan: -0.4, p: { a: '0120120120120123', b: '3210321032103210' }, o: 'aaaa abababab aaaaaaab abababab aaaa' },
+        { k: 'bass', i: 'bass', lo: 40, v: 0.45, p: { a: '1.1.8.1.1.1.8.5.', b: '1.1.8.1.1.1.5.8.' }, o: 'aaab' },
+        { k: 'drum', v: 0.45, p: { q: 'k...k...k...k.hh', a: 'k.h.s.hkk.h.s.h.', b: 'k.h.s.hkk.hks.sg', c: 'c.h.s.hkk.h.s.h.', f: 'k.h.s.h.t.t.m.l.' }, o: 'qqqf caabaaaf caabaabf caabaaaf cbbf' },
+        { k: 'mel', i: 'saw', v: 1, pan: 0.2, o: 'zabar', p: {
+          z: 'E4:2 E4:1 E4:1 G4:2 E4:2 A4:2 G4:2 F#4:2 D4:2  E4:2 E4:1 E4:1 G4:2 E4:2 A4:2 G4:2 F#4:2 D4:2  ' +
+            'E4:2 E4:1 E4:1 G4:2 E4:2 C5:2 B4:2 G4:2 E4:2  F#4:2 F#4:1 F#4:1 A4:2 F#4:2 D5:2 C5:2 A4:2 F#4:2',
+          a: 'E5:6 F#5:2 G5:4 B5:4  B5:6 A5:2 G5:4 F#5:4  G5:6 E5:2 C5:4 E5:4  D5:4 F#5:4 A5:8  ' +
+            'G5:6 F#5:2 E5:4 B4:4  E5:4 G5:4 B5:4 E6:4  C6:6 B5:2 A5:4 E5:4  D#5:8 F#5:4 B5:4',
+          b: 'E5:2 G5:2 C6:4 B5:4 G5:4  A5:6 F#5:2 D5:8  F#5:2 B5:2 D6:4 B5:4 A5:4  B5:6 G5:2 E5:8  ' +
+            'G5:4 A5:4 B5:4 C6:4  D6:6 C6:2 B5:4 A5:4  B5:4 A5:4 F#5:4 D#5:4  F#5:8 D#5:4 B4:4',
+          r: 'E5:2 E5:1 E5:1 G5:2 E5:2 A5:2 G5:2 F#5:2 D5:2  E5:2 E5:1 E5:1 G5:2 E5:2 C6:2 B5:2 G5:2 E5:2  ' +
+            'A5:2 A5:1 A5:1 C6:2 A5:2 E6:2 C6:2 B5:2 A5:2  B5:4 F#5:4 D#5:4 B4:4',
+        } },
+      ],
+    },
+    // C minor dread: pipe organ, choir, galloping bass, double kick.
+    boss: {
+      bpm: 150, bars: 32,
+      chords: 'Cm G Ab G  Cm G Ab Ab Fm G Cm G  Db Db Cm G Ab Fm G G  Fm Db Cm Cm Db Ab G G  Cm G Ab G',
+      ch: [
+        { k: 'pad', i: 'choir', lo: 55, v: 0.7 },
+        { k: 'arp', i: 'stab', lo: 60, v: 0.75, pan: -0.35, p: { r: '................', a: 'c..c..c...c..c..', b: 'c..c..c.c.c.c.c.' }, o: 'rrrb aaaaaaab aaaaaaab aaaaaaab aaab' },
+        { k: 'bass', i: 'bass', lo: 36, v: 0.47, p: { i: '1...............', a: '1.111.111.111.11', b: '1.111.111.1.8.5.' }, o: 'iiib aaaaaaab aaaaaaab aaaaaaab aaab' },
+        { k: 'drum', v: 0.32, p: { i: 'T...k...T...k.k.', a: 'KhKkShKhKhKkShKk', f: 'KhKkShKht.t.m.l.', c: 'chKkShKhKhKkShKk' }, o: 'iiif caaaaaaf caaaaaaf caaaaaaf caaf' },
+        { k: 'mel', i: 'organ', v: 0.9, pan: 0.2, o: 'zabco', p: {
+          z: 'C4:4 C4:2 C4:2 Eb4:4 C4:4  D4:4 D4:2 Eb4:2 D4:4 B3:4  C4:4 C4:2 C4:2 Eb4:4 Ab4:4  G4:16',
+          a: 'C5:6 D5:2 Eb5:4 G5:4  F5:2 Eb5:2 D5:4 C5:4 B4:4  C5:6 Eb5:2 Ab5:8  Ab5:4 G5:4 Eb5:4 C5:4  ' +
+            'F5:6 G5:2 Ab5:4 C6:4  B5:6 Ab5:2 G5:4 F5:4  Eb5:4 D5:4 C5:4 G4:4  B4:8 D5:4 G5:4',
+          b: 'F5:4 Ab5:4 Db6:8  C6:2 Db6:2 Ab5:4 F5:4 Db5:4  Eb5:6 G5:2 C6:8  D6:4 C6:4 B5:4 G5:4  ' +
+            'Ab5:6 G5:2 F5:4 Eb5:4  F5:4 Ab5:4 C6:4 F6:4  G5:12 Ab5:2 G5:2  F5:4 Eb5:4 D5:4 B4:4',
+          c: 'C5:4 F5:4 Ab5:4 C6:4  Db6:6 C6:2 Ab5:8  G5:4 Eb5:4 C5:4 Eb5:4  G5:8 Ab5:4 G5:4  ' +
+            'F5:4 Ab5:4 Db6:4 F6:4  Eb6:6 Db6:2 C6:8  B5:4 D6:4 F6:4 D6:4  B5:8 G5:8',
+          o: 'C5:4 C5:2 C5:2 Eb5:4 C5:4  D5:4 D5:2 Eb5:2 D5:4 B4:4  C5:4 C5:2 C5:2 Eb5:4 Ab5:4  G5:8 B4:8',
+        } },
+      ],
+    },
+    // D major brass fanfare, then a gentle dawn loop (from bar 5).
+    victory: {
+      bpm: 100, bars: 20, loop: 4,
+      chords: 'D G A D  D A Bm F#m G D Em A  D A Bm G Em A D D',
+      ch: [
+        { k: 'pad', i: 'strings', lo: 57, v: 0.55 },
+        { k: 'arp', i: 'harp', lo: 50, v: 0.75, pan: -0.3, p: { r: '................', g: '0123456789......', a: '0.1.2.3.4.3.2.1.' }, o: 'rrrg aaaaaaaaaaaaaaaa' },
+        { k: 'bass', i: 'dbass', lo: 38, v: 0.75, p: { f: '1...............', a: '1.......5.......' }, o: 'ffff aaaaaaaaaaaaaaaa' },
+        { k: 'drum', v: 0.6, p: { x: 'c...............', y: 'T.....T.T.......', z: 'T...T...TTTTTTTT', w: 'c...........T...', q: '................', s: 'k.......b.......' }, o: 'xyzw qqqqqqqq ssssssss' },
+        { k: 'mel', i: 'flute', v: 0.65, pan: 0.15, o: 'fgh', p: {
+          f: '@brass A4:2 A4:1 A4:1 D5:4 F#5:4 A5:4  B5:8 A5:2 G5:2 F#5:2 G5:2  A5:4 E5:2 F#5:2 G5:4 C#6:4  D6:12 r:4',
+          g: 'F#5:8 E5:4 D5:4  C#5:8 E5:4 A4:4  D5:6 C#5:2 B4:8  A4:6 B4:2 C#5:8  B4:4 D5:4 G5:8  F#5:6 E5:2 D5:8  E5:4 F#5:4 G5:4 B5:4  A5:12 r:4',
+          h: 'F#5:6 G5:2 A5:8  G5:4 F#5:4 E5:8  F#5:4 D5:4 B4:8  B5:6 A5:2 G5:8  G5:4 F#5:4 E5:4 D5:4  C#5:6 D5:2 E5:8  D5:16  r:16',
+        } },
+        { k: 'mel', i: 'brass', v: 0.45, pan: -0.2, o: 'fz', p: {
+          f: 'F#4:2 F#4:1 F#4:1 A4:4 D5:4 F#5:4  G5:8 F#5:2 E5:2 D5:2 E5:2  E5:4 C#5:2 D5:2 E5:4 A5:4  F#5:12 r:4',
+          z: 'r:256',
+        } },
+      ],
+    },
+    // Short sting, no loop.
+    defeat: {
+      bpm: 80, bars: 2, loop: -1,
+      chords: 'Bb:8 A:8 Dm',
+      ch: [
+        { k: 'pad', i: 'choir', lo: 50, v: 0.9 },
+        { k: 'bass', i: 'dbass', lo: 38, v: 0.8, p: '1.......1.......1...............' },
+        { k: 'drum', v: 0.7, p: 'T.......T.......T...............' },
+        { k: 'mel', i: 'brass', v: 0.6, p: 'A4:4 G4:4 F4:4 E4:4  D4:16' },
+        { k: 'mel', i: 'bell', v: 0.5, p: 'r:16 D3:16' },
+      ],
+    },
+  };
+
+  // ---------------------------------------------------------------
+  // Song compiler: text patterns -> per-step event lists.
+  // ---------------------------------------------------------------
+  const PC = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+  const QUAL = { '': [0, 4, 7], m: [0, 3, 7], 7: [0, 4, 7, 10], m7: [0, 3, 7, 10], M7: [0, 4, 7, 11], sus2: [0, 2, 7], sus4: [0, 5, 7], dim: [0, 3, 6], 5: [0, 7], aug: [0, 4, 8] };
+  const noteMidi = s => {
+    const m = /^([A-G])([#b]?)(-?\d)$/.exec(s);
+    return m ? 12 * (+m[3] + 1) + PC[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0) : null;
+  };
+  const inWindow = (pc, lo) => lo + (((pc - lo) % 12) + 12) % 12;
+  const KIT = {
+    k: [['kick', 1]], K: [['kick', 1], ['hat', 0.45]], s: [['snare', 0.85]], S: [['snare', 0.85], ['hat', 0.45]],
+    g: [['snare', 0.22]], h: [['hat', 0.5]], H: [['hat', 0.8]], o: [['ohat', 0.55]], c: [['crash', 0.6], ['kick', 1]],
+    C: [['crash', 0.6]], t: [['tom', 0.8, 1.45]], m: [['tom', 0.8, 1.15]], l: [['tom', 0.85, 0.85]],
+    x: [['kick', 1], ['snare', 0.85]], b: [['shaker', 0.45]],
+  };
+  const errors = [];
+
+  function compile(name, def) {
+    const bar = def.bar || 16, total = def.bars * bar, err = m => errors.push(name + ': ' + m);
+    const steps = Array.from({ length: total }, () => []);
+    const chordAt = new Array(total);
+    let pos = 0;
+    for (const tok of def.chords.split(/\s+/).filter(Boolean)) {
+      const [nm, ln] = tok.split(':'), m = /^([A-G])([#b]?)(.*)$/.exec(nm), L = ln ? +ln : bar;
+      if (!m || !QUAL[m[3]]) { err('bad chord ' + tok); continue; }
+      const ch = { pc: (PC[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0) + 12) % 12, iv: QUAL[m[3]], at: pos, len: L };
+      for (let k = 0; k < L && pos + k < total; k++) chordAt[pos + k] = ch;
+      pos += L;
+    }
+    if (pos !== total) err('chords cover ' + pos + ' of ' + total + ' steps');
+    const stream = (c, sep) => {   // patterns in play order; grids repeat the order to fill the song
+      const P = typeof c.p === 'string' ? { a: c.p } : c.p, ord = (c.o || 'a').replace(/\s/g, '');
+      const parts = [];
+      let len = 0;
+      for (let k = 0; k < ord.length || (!sep && len < total && k < 4096); k++) {
+        const pat = P[ord[k % ord.length]];
+        if (pat == null) { err('missing pattern ' + ord[k % ord.length]); break; }
+        const x = sep ? pat : pat.replace(/[\s|]/g, '');
+        if (!x.length) break;
+        parts.push(x); len += x.length;
+      }
+      return sep ? parts : parts.join('');
+    };
+    const ladder = (ch, lo) => {
+      const r = inWindow(ch.pc, lo), n = ch.iv.length, out = [];
+      for (let i = 0; i < 12; i++) out.push(r + ch.iv[i % n] + 12 * Math.floor(i / n));
+      return out;
+    };
+    def.ch.forEach((c, ci) => {
+      const add = (at, ev) => { if (at < total) { ev.c = ci; steps[at].push(ev); } };
+      if (c.k === 'pad') {
+        for (let s = 0; s < total; s++) {
+          const ch = chordAt[s];
+          if (ch && ch.at === s) add(s, { i: c.i, ms: ch.iv.map(x => inWindow(ch.pc + x, c.lo)).sort((a, b) => a - b), l: ch.len });
+        }
+      } else if (c.k === 'mel') {
+        let at = 0;
+        for (const ph of stream(c, true)) {
+          let inst = c.i;
+          for (const tok of ph.split(/\s+/).filter(t => t && t !== '|')) {
+            if (tok[0] === '@') { inst = tok.slice(1); if (!INST[inst]) err('unknown instrument ' + inst); continue; }
+            const [n, ln] = tok.split(':'), L = +ln;
+            if (!(L > 0)) { err('bad length ' + tok); continue; }
+            if (n !== 'r') {
+              const m = noteMidi(n);
+              if (m === null) err('bad note ' + tok); else add(at, { i: inst, m, l: L });
+            }
+            at += L;
+          }
+        }
+        if (at !== total) err('melody ' + ci + ' covers ' + at + ' of ' + total + ' steps');
+      } else {
+        const s = stream(c, false);
+        if (s.length !== total) err(c.k + ' ' + ci + ' covers ' + s.length + ' of ' + total + ' steps');
+        for (let i = 0; i < Math.min(s.length, total); i++) {
+          const ch = s[i], cd = chordAt[i];
+          if (ch === '.' || ch === '-' || !cd) continue;
+          let len = 1;
+          while (i + len < s.length && s[i + len] === '.') len++;
+          if (c.k === 'drum') {
+            if (ch === 'T') add(i, { d: [['timp', 0.9, hz(inWindow(cd.pc, 40)) / 98]] });
+            else if (KIT[ch]) add(i, { d: KIT[ch] });
+            else err('unknown drum ' + ch);
+          } else if (c.k === 'bass') {
+            const iv = cd.iv, off = { 0: -12, 1: 0, 2: 2, 3: iv[1], 4: 5, 5: iv[2] == null ? 7 : iv[2], 6: 9, 7: iv[3] == null ? 10 : iv[3], 8: 12 }[ch];
+            if (off == null) err('bad bass ' + ch); else add(i, { i: c.i, m: inWindow(cd.pc, c.lo) + off, l: len });
+          } else if (ch === 'c') {
+            add(i, { i: c.i, ms: cd.iv.map(x => inWindow(cd.pc + x, c.lo)), l: len });
+          } else if (ch >= '0' && ch <= '9') {
+            add(i, { i: c.i, m: ladder(cd, c.lo)[+ch], l: len });
+          } else err('bad arp ' + ch);
+        }
+      }
+    });
+    return {
+      name, bar, total, bars: def.bars, steps, ch: def.ch,
+      sd: 60 / def.bpm / 4, loop: def.loop == null ? 0 : def.loop,
+    };
+  }
+  const SONG = {};
+  for (const k in SONGS) { try { SONG[k] = compile(k, SONGS[k]); } catch (e) { errors.push(k + ': ' + e.message); } }
+
+  // ---------------------------------------------------------------
+  // Player: look-ahead scheduler. tick(until) schedules every step that
+  // starts before `until`. The live context calls it every 25 ms with
+  // until = now + 100 ms; the offline renderer calls it once.
+  // ---------------------------------------------------------------
+  function makePlayer(E, name, t0, startStep) {
+    const S = SONG[name];
+    if (!S) return null;
+    const c = E.ctx, out = gain(c, 1);
+    out.connect(E.musicBus);
+    const P = { name, S, E, out, t0, n: 0, step: startStep || 0, done: false, nodes: [], late: 0, endT: 0 };
+    P.track = (node, end) => { P.nodes.push({ node, end }); };
+    P.V = S.ch.map(ch => {
+      const g = gain(c, ch.v == null ? 1 : ch.v), pn = panner(c, ch.pan);
+      g.connect(pn); pn.connect(out);
+      return { E, dest: g, track: P.track };
+    });
+    return P;
+  }
+
+  function playStep(P, idx, t) {
+    const S = P.S;
+    for (const ev of S.steps[idx]) {
+      const V = P.V[ev.c];
+      if (P.solo != null && P.solo !== ev.c) continue;
+      if (ev.d) { for (const [nm, v, rate] of ev.d) drumHit(V, t, nm, v, rate); continue; }
+      const fn = INST[ev.i], dur = ev.l * S.sd;
+      if (!fn) continue;
+      if (ev.ms) { const v = 1 / Math.sqrt(ev.ms.length); for (const m of ev.ms) fn(V, t, m, dur, v); }
+      else fn(V, t, ev.m, dur, 1);
+    }
+  }
+
+  function tick(P, until) {
+    const S = P.S;
+    while (!P.done) {
+      const t = P.t0 + P.n * S.sd;
+      if (t >= until) break;
+      playStep(P, P.step, t);
+      P.n++; P.step++;
+      if (P.step >= S.total) {
+        if (S.loop < 0) { P.done = true; P.endT = t + S.sd + 3; } else P.step = S.loop * S.bar;
+      }
+    }
+  }
+
+  function stopPlayer(P, fade) {
+    const c = P.E.ctx, now = c.currentTime, g = P.out.gain;
+    P.done = true;
+    try {
+      g.cancelScheduledValues(now);
+      g.setValueAtTime(g.value, now);
+      g.linearRampToValueAtTime(0, now + fade);
+    } catch (_) { /* ignore */ }
+    const kill = () => {
+      for (const x of P.nodes) { try { x.node.stop(); } catch (_) { /* already stopped */ } }
+      P.nodes = [];
+      try { P.out.disconnect(); } catch (_) { /* ignore */ }
+    };
+    setTimeout(kill, (fade + 0.15) * 1000);
+  }
+
+  // ---------------------------------------------------------------
+  // SFX building blocks (fire-and-forget into `o`)
+  // ---------------------------------------------------------------
+  // Tone: {type|w, f, f1, ft, fp (freq path), a, d, v, det, flt, ff, q, lfo:[rate, depthHz, type]}
+  function T(E, o, t, x) {
+    const c = E.ctx, os = c.createOscillator(), g = c.createGain();
+    if (x.w) os.setPeriodicWave(E.waves[x.w]); else os.type = x.type || 'sine';
+    if (x.fp) path(E, os.frequency, t, x.fp);
+    else {
+      os.frequency.setValueAtTime(x.f, t);
+      if (x.f1) os.frequency.exponentialRampToValueAtTime(x.f1, t + (x.ft || (x.a || 0.002) + x.d));
+    }
+    if (x.det) os.detune.value = x.det;
+    g.gain.value = 0;
+    const end = perc(g.gain, t, x.a || 0.002, x.v, x.d);
+    if (x.flt) { const f = filt(E, x.flt, x.ff, x.q); os.connect(f); f.connect(g); } else os.connect(g);
+    g.connect(o);
+    os.start(t); os.stop(end + 0.02);
+    if (x.lfo) {
+      const l = c.createOscillator(), lg = gain(c, x.lfo[1]);
+      l.type = x.lfo[2] || 'sine'; l.frequency.value = x.lfo[0];
+      l.connect(lg); lg.connect(os.frequency); l.start(t); l.stop(end + 0.02);
+    }
+    return end;
+  }
+  // Filtered noise: {ft, f, f1, fT, q, a, d, v}
+  function N(E, o, t, x) {
+    const c = E.ctx, s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = E.noise; s.loop = true;
+    f.type = x.ft || 'bandpass'; f.Q.value = x.q || 1;
+    f.frequency.setValueAtTime(Math.min(x.f, E.nyq), t);
+    if (x.f1) f.frequency.exponentialRampToValueAtTime(Math.min(x.f1, E.nyq), t + (x.fT || (x.a || 0.002) + x.d));
+    g.gain.value = 0;
+    const end = perc(g.gain, t, x.a || 0.002, x.v, x.d);
+    s.connect(f); f.connect(g); g.connect(o);
+    s.start(t, Math.random() * 1.5); s.stop(end + 0.02);
+    return end;
+  }
+  // Long held layer with linear fade in/out (rumbles, grinding): src 'noise' or osc type
+  function held(E, o, t, dur, x) {
+    const c = E.ctx, g = c.createGain(), f = filt(E, x.ft || 'lowpass', x.f, x.q);
+    let s;
+    if (x.src === 'noise') { s = c.createBufferSource(); s.buffer = E.noise; s.loop = true; }
+    else { s = c.createOscillator(); s.type = x.src; s.frequency.value = x.fo; }
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(x.v, t + x.a);
+    g.gain.setValueAtTime(x.v, t + dur - x.r);
+    g.gain.linearRampToValueAtTime(0, t + dur);
+    let head = g;
+    if (x.am) {   // amplitude wobble (ratchet / growl)
+      const am = gain(c, 1 - x.am[1]), l = c.createOscillator(), lg = gain(c, x.am[1]);
+      l.type = x.am[2] || 'sawtooth'; l.frequency.value = x.am[0];
+      l.connect(lg); lg.connect(am.gain); am.connect(g); head = am;
+      l.start(t); l.stop(t + dur + 0.02);
+    }
+    if (x.lfo && s.frequency) {
+      const l = c.createOscillator(), lg = gain(c, x.lfo[1]);
+      l.frequency.value = x.lfo[0]; l.connect(lg); lg.connect(s.frequency);
+      l.start(t); l.stop(t + dur + 0.02);
+    }
+    s.connect(f); f.connect(head); g.connect(o);
+    if (x.src === 'noise') s.start(t, Math.random()); else s.start(t);
+    s.stop(t + dur + 0.02);
+  }
+  // Metallic ring: inharmonic sine partials
+  function R(E, o, t, f, ratios, v, d) {
+    ratios.forEach((r, i) => T(E, o, t, { f: f * r, v: v / (1 + i * 0.5), d: d / (1 + i * 0.3), a: 0.001 }));
+  }
+  function swish(E, o, t, p, D, v) {
+    N(E, o, t, { ft: 'bandpass', f: 320 * p, f1: 2600 * p, fT: D * 0.7, q: 1.6, a: D * 0.55, d: D * 0.45, v });
+    N(E, o, t, { ft: 'bandpass', f: 170 * p, f1: 900 * p, fT: D * 0.7, q: 1, a: D * 0.55, d: D * 0.45, v: v * 0.6 });
+  }
+  function footstep(E, o, t, p, v) {
+    N(E, o, t, { ft: 'lowpass', f: 420 * p, v: 0.55 * v, d: 0.05 });
+    N(E, o, t + 0.004, { ft: 'bandpass', f: 2300 * p, q: 1.2, v: 0.16 * v, d: 0.03 });
+  }
+  const sv = (E, o) => ({ E, dest: o, track: () => {} });
+  // Output trim per effect, so combat hits sit clearly above the music.
+  const LVL = { hit: 1.6, crit: 1.5, hurt: 1.6, block: 1.5, parry: 1.6, whoosh: 1.2, miss: 1.4, step: 3, screech: 2.2,
+    flee: 1.4, deny: 1.3, equip: 1.4, magic: 1.6, ice: 1.5, zap: 1.5, fire: 1.5, stun: 1.3, gate: 1.1 };
+  const semi = p => 12 * Math.log2(p);
+
+  const SFX = {
+    tap(E, o, t, p) {
+      T(E, o, t, { type: 'triangle', f: 1250 * p, f1: 900 * p, ft: 0.04, v: 0.3, d: 0.05 });
+      N(E, o, t, { ft: 'highpass', f: 4000, v: 0.08, d: 0.015 });
+    },
+    back(E, o, t, p) {
+      T(E, o, t, { type: 'triangle', f: 720 * p, f1: 430 * p, ft: 0.08, v: 0.3, d: 0.09 });
+      N(E, o, t, { ft: 'bandpass', f: 1800, v: 0.06, d: 0.02 });
+    },
+    coin(E, o, t, p) {
+      R(E, o, t, 1980 * p, [1, 1.5, 2.66], 0.22, 0.22);
+      R(E, o, t + 0.07, 2640 * p, [1, 1.5, 2.66], 0.25, 0.45);
+    },
+    buy(E, o, t, p) {
+      N(E, o, t, { ft: 'lowpass', f: 900, v: 0.35, d: 0.06 });
+      T(E, o, t, { f: 180 * p, f1: 90 * p, v: 0.3, d: 0.08 });
+      for (let i = 0; i < 4; i++) R(E, o, t + 0.06 + i * 0.055, (2100 + i * 260) * p * (0.97 + Math.random() * 0.06), [1, 1.5, 2.7], 0.13, 0.3);
+      N(E, o, t + 0.05, { ft: 'bandpass', f: 7000, q: 2, v: 0.1, a: 0.01, d: 0.25 });
+    },
+    deny(E, o, t, p) {
+      for (let i = 0; i < 2; i++) {
+        T(E, o, t + i * 0.11, { type: 'square', f: 155 * p, v: 0.13, a: 0.004, d: 0.08, flt: 'lowpass', ff: 1400 });
+        T(E, o, t + i * 0.11, { type: 'square', f: 146 * p, v: 0.13, a: 0.004, d: 0.08, flt: 'lowpass', ff: 1400 });
+      }
+    },
+    equip(E, o, t, p) {
+      N(E, o, t, { ft: 'bandpass', f: 2200 * p, f1: 6500 * p, q: 3, v: 0.3, a: 0.02, d: 0.12 });
+      R(E, o, t + 0.04, 1560 * p, [1, 1.47, 2.09, 2.9], 0.12, 0.35);
+      N(E, o, t, { ft: 'lowpass', f: 600, v: 0.3, d: 0.05 });
+    },
+    hit(E, o, t, p) {
+      T(E, o, t, { f: 170 * p, f1: 55 * p, ft: 0.09, v: 0.75, d: 0.12 });
+      N(E, o, t, { ft: 'lowpass', f: 2600 * p, v: 0.6, d: 0.09 });
+      N(E, o, t, { ft: 'bandpass', f: 1200 * p, q: 1.5, v: 0.5, d: 0.035 });
+      N(E, o, t, { ft: 'highpass', f: 5000, v: 0.15, d: 0.02 });
+    },
+    crit(E, o, t, p) {
+      const c = E.ctx, sh = c.createWaveShaper(), g = gain(c, 0.55);
+      sh.curve = E.crunch; sh.connect(g); g.connect(o);
+      T(E, sh, t, { f: 130 * p, f1: 34 * p, ft: 0.22, v: 0.9, d: 0.28 });
+      N(E, sh, t, { ft: 'lowpass', f: 3500 * p, f1: 400, fT: 0.25, v: 0.9, d: 0.26 });
+      N(E, o, t, { ft: 'bandpass', f: 1500 * p, q: 1.2, v: 0.55, d: 0.05 });
+      N(E, o, t, { ft: 'highpass', f: 4500, v: 0.3, d: 0.03 });
+      R(E, o, t, 620 * p, [1, 1.83, 2.71], 0.14, 0.25);
+      T(E, o, t, { f: 62 * p, f1: 30 * p, v: 0.6, d: 0.35 });
+    },
+    miss(E, o, t, p) {
+      swish(E, o, t, p * 1.25, 0.2, 0.35);
+    },
+    hurt(E, o, t, p) {
+      T(E, o, t, { f: 140 * p, f1: 45 * p, ft: 0.15, v: 0.85, d: 0.18 });
+      N(E, o, t, { ft: 'lowpass', f: 1800, v: 0.6, d: 0.12 });
+      T(E, o, t + 0.01, { type: 'sawtooth', f: 210 * p, f1: 130 * p, ft: 0.16, v: 0.3, a: 0.01, d: 0.17, flt: 'bandpass', ff: 650 * p, q: 3 });
+    },
+    block(E, o, t, p) {
+      const lp = filt(E, 'lowpass', 2600); lp.connect(o);
+      R(E, lp, t, 380 * p, [1, 2.32, 3.89, 5.1], 0.32, 0.22);
+      T(E, o, t, { f: 150 * p, f1: 80 * p, v: 0.5, d: 0.09 });
+      N(E, o, t, { ft: 'bandpass', f: 1100 * p, q: 1, v: 0.5, d: 0.06 });
+      N(E, o, t, { ft: 'lowpass', f: 500, v: 0.45, d: 0.1 });
+    },
+    parry(E, o, t, p) {
+      swish(E, o, t, p * 1.4, 0.22, 0.3);
+      N(E, o, t, { ft: 'highpass', f: 3500, v: 0.45, d: 0.025 });
+      const f = 2150 * p;
+      for (const [r, v, d] of [[1, 0.26, 1.1], [1.004, 0.18, 1.0], [2.08, 0.14, 0.8], [2.093, 0.09, 0.7], [3.42, 0.07, 0.5], [4.95, 0.045, 0.35]]) {
+        T(E, o, t, { f: f * r, v, d, a: 0.0015 });
+      }
+      T(E, o, t, { f: 520 * p, f1: 380 * p, v: 0.25, d: 0.08 });
+    },
+    whoosh(E, o, t, p) {
+      swish(E, o, t, p, 0.3 / Math.sqrt(p), 0.5);
+    },
+    fire(E, o, t, p) {
+      N(E, o, t, { ft: 'lowpass', f: 250 * p, f1: 3000 * p, fT: 0.25, q: 1.5, a: 0.06, d: 0.6, v: 0.75 });
+      N(E, o, t, { ft: 'bandpass', f: 900 * p, q: 0.8, a: 0.03, d: 0.4, v: 0.3 });
+      T(E, o, t, { f: 90 * p, f1: 45 * p, v: 0.5, a: 0.02, d: 0.35 });
+      for (let i = 0; i < 7; i++) N(E, o, t + 0.08 + Math.random() * 0.5, { ft: 'highpass', f: 2500 + Math.random() * 3000, v: 0.15 + Math.random() * 0.2, d: 0.012 });
+    },
+    ice(E, o, t, p) {
+      N(E, o, t, { ft: 'bandpass', f: 3000, q: 2, v: 0.4, d: 0.03 });
+      N(E, o, t, { ft: 'highpass', f: 5000, a: 0.02, d: 0.45, v: 0.25 });
+      [2637, 3136, 3520, 4186, 3951, 4699].forEach((f, i) => T(E, o, t + i * 0.045 + Math.random() * 0.02, { f: f * p, v: 0.1, d: 0.25 }));
+      T(E, o, t, { type: 'triangle', f: 1400 * p, f1: 700 * p, v: 0.12, d: 0.3 });
+    },
+    zap(E, o, t, p) {
+      T(E, o, t, { type: 'sawtooth', f: 1600 * p, f1: 110 * p, ft: 0.36, v: 0.28, a: 0.003, d: 0.36, flt: 'highpass', ff: 300, lfo: [47, 600 * p, 'square'] });
+      N(E, o, t, { ft: 'bandpass', f: 600, q: 0.7, v: 0.45, d: 0.08 });
+      N(E, o, t, { ft: 'highpass', f: 3000, v: 0.4, d: 0.3 });
+      for (let i = 0; i < 4; i++) N(E, o, t + 0.05 + Math.random() * 0.25, { ft: 'highpass', f: 4000, v: 0.3, d: 0.015 });
+    },
+    heal(E, o, t, p) {
+      [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach((f, i) => T(E, o, t + i * 0.07, { type: 'triangle', f: f * p, v: 0.16, a: 0.01, d: 0.5 }));
+      T(E, o, t, { f: 392 * p, f1: 784 * p, ft: 0.5, v: 0.12, a: 0.15, d: 0.5 });
+      N(E, o, t, { ft: 'highpass', f: 7000, a: 0.2, d: 0.4, v: 0.06 });
+    },
+    magic(E, o, t, p) {
+      T(E, o, t, { type: 'triangle', f: 330 * p, f1: 1320 * p, ft: 0.4, v: 0.2, a: 0.05, d: 0.45, lfo: [9, 25 * p] });
+      T(E, o, t, { type: 'triangle', f: 335 * p, f1: 990 * p, ft: 0.4, v: 0.15, a: 0.05, d: 0.45, lfo: [7, 20 * p] });
+      for (let i = 0; i < 5; i++) T(E, o, t + 0.1 + i * 0.06, { f: (1500 + Math.random() * 1500) * p, v: 0.06, d: 0.15 });
+      N(E, o, t, { ft: 'bandpass', f: 2000 * p, f1: 6000 * p, q: 4, a: 0.1, d: 0.35, v: 0.1 });
+    },
+    drink(E, o, t, p) {
+      for (let i = 0; i < 3; i++) T(E, o, t + i * 0.12 + Math.random() * 0.02, { f: (220 + i * 40) * p, f1: (520 + i * 80) * p, ft: 0.06, v: 0.3, a: 0.005, d: 0.07 });
+      N(E, o, t, { ft: 'bandpass', f: 900, q: 2, a: 0.02, d: 0.35, v: 0.08 });
+      T(E, o, t + 0.42, { type: 'triangle', f: 900 * p, f1: 1400 * p, ft: 0.08, v: 0.12, d: 0.12 });
+    },
+    stun(E, o, t, p) {
+      T(E, o, t, { f: 220 * p, f1: 70 * p, v: 0.6, d: 0.15 });
+      N(E, o, t, { ft: 'bandpass', f: 1500, q: 2, v: 0.3, d: 0.04 });
+      for (let i = 0; i < 3; i++) T(E, o, t + 0.12 + i * 0.13, { f: (1800 + i * 150) * p, f1: 2400 * p, ft: 0.06, v: 0.1, a: 0.01, d: 0.12, lfo: [14, 200] });
+    },
+    levelup(E, o, t, p) {
+      const V = sv(E, o), dm = semi(p);
+      [72, 76, 79, 84, 88, 91].forEach((m, i) => {
+        INST.spluck(V, t + i * 0.065, m + dm, 0.1, 1.6);
+        bellNote(V, t + i * 0.065, hz(m + dm + 12), 0.07, 0.8);
+      });
+      [84, 88, 91, 96].forEach(m => bellNote(V, t + 0.4, hz(m + dm), 0.09, 1.4));
+      [60, 64, 67, 72].forEach(m => INST.brass(V, t + 0.4, m + dm, 0.5, 0.7));
+      N(E, o, t + 0.38, { ft: 'highpass', f: 6000, a: 0.05, d: 0.6, v: 0.08 });
+    },
+    victory(E, o, t, p) {
+      const V = sv(E, o), dm = semi(p), s = 0.1;
+      for (const [m, at, len] of [[67, 0, 1], [72, 1, 1], [76, 2, 1], [79, 3, 2], [76, 5, 1], [79, 6, 8]]) INST.brass(V, t + at * s, m + dm, len * s * 0.85, 1);
+      [60, 64, 67, 72].forEach(m => INST.brass(V, t + 6 * s, m + dm, 0.75, 0.6));
+      hitBuf(E, o, t + 6 * s, 'timp', 0.8, hz(48 + dm) / 98);
+      hitBuf(E, o, t + 6 * s, 'crash', 0.35);
+      bellNote(V, t + 6 * s, hz(91 + dm), 0.1, 1.2);
+    },
+    defeat(E, o, t, p) {
+      const V = sv(E, o), dm = semi(p);
+      [[52, 0, 0.28], [51, 0.32, 0.28], [50, 0.64, 1.1]].forEach(([m, at, len]) => INST.brass(V, t + at, m + dm, len, 1));
+      [50, 53, 57].forEach(m => INST.choir(V, t + 0.6, m + dm, 1.0, 1.4));
+      hitBuf(E, o, t + 0.64, 'timp', 0.9, hz(38 + dm) / 98);
+      bellNote(V, t + 0.64, hz(38 + dm), 0.25, 2.4);
+    },
+    flee(E, o, t, p) {
+      for (let i = 0; i < 4; i++) footstep(E, o, t + i * 0.09, p * (1 + i * 0.05), 1 - i * 0.18);
+      swish(E, o, t + 0.12, p * 0.8, 0.35, 0.35);
+    },
+    gate(E, o, t, p) {
+      const D = 3.6;
+      T(E, o, t, { f: 90 * p, f1: 40 * p, v: 0.7, d: 0.35 });
+      R(E, o, t, 310 * p, [1, 1.58, 2.37, 3.1], 0.25, 0.7);
+      N(E, o, t, { ft: 'bandpass', f: 900, q: 1, v: 0.4, d: 0.08 });
+      held(E, o, t + 0.15, D, { src: 'noise', ft: 'lowpass', f: 110 * p, q: 0.8, a: 0.6, r: 0.5, v: 1.1 });
+      held(E, o, t + 0.2, D - 0.2, { src: 'noise', ft: 'bandpass', f: 380 * p, q: 2.5, a: 0.4, r: 0.5, v: 0.6, am: [11, 0.6] });
+      held(E, o, t + 0.25, D - 0.3, { src: 'sawtooth', fo: 44 * p, ft: 'lowpass', f: 320, q: 1, a: 0.5, r: 0.6, v: 0.3, lfo: [0.8, 4] });
+      for (let k = t + 0.35; k < t + D; k += 0.1 + Math.random() * 0.06) {
+        const f = (1100 + Math.random() * 900) * p;
+        N(E, o, k, { ft: 'bandpass', f: f * 1.8, q: 5, v: 0.2 + Math.random() * 0.15, d: 0.04 });
+        R(E, o, k, f, [1, 1.41, 2.3], 0.05 + Math.random() * 0.04, 0.09);
+      }
+      const s = t + D + 0.05;
+      T(E, o, s, { f: 70 * p, f1: 28 * p, v: 0.9, d: 0.9 });
+      N(E, o, s, { ft: 'lowpass', f: 1800, f1: 200, fT: 0.6, v: 0.7, d: 0.7 });
+      R(E, o, s, 180 * p, [1, 1.63, 2.51, 3.3], 0.22, 1.4);
+      hitBuf(E, o, s, 'crash', 0.22, 0.6);
+    },
+    door(E, o, t, p) {
+      T(E, o, t, { type: 'sawtooth', f: 85 * p, f1: 125 * p, ft: 0.3, v: 0.14, a: 0.04, d: 0.28, flt: 'bandpass', ff: 1100 * p, q: 4, lfo: [23, 25] });
+      N(E, o, t, { ft: 'bandpass', f: 3000, q: 3, v: 0.12, d: 0.02 });
+      N(E, o, t + 0.32, { ft: 'lowpass', f: 700, v: 0.45, d: 0.08 });
+      T(E, o, t + 0.32, { f: 110 * p, f1: 60 * p, v: 0.4, d: 0.1 });
+    },
+    roar(E, o, t, p) {
+      const c = E.ctx, s = 1 / Math.sqrt(p), D = 1.15 * s;
+      const amp = c.createGain(), lp = filt(E, 'lowpass', 400, 3), am = gain(c, 0.68);
+      path(E, lp.frequency, t, [380 * p, [1500 * p, 0.25 * s], [520 * p, D]]);
+      amp.gain.setValueAtTime(0, t);
+      amp.gain.linearRampToValueAtTime(0.5, t + 0.12 * s);
+      amp.gain.linearRampToValueAtTime(0.38, t + 0.6 * D);
+      amp.gain.exponentialRampToValueAtTime(0.0005, t + D);
+      amp.gain.linearRampToValueAtTime(0, t + D + 0.02);
+      const lfo = c.createOscillator(), lg = gain(c, 0.32);
+      lfo.type = 'triangle'; lfo.frequency.value = 27 + Math.random() * 8;
+      lfo.connect(lg); lg.connect(am.gain);
+      am.connect(lp); lp.connect(amp); amp.connect(o);
+      for (const [r, det] of [[1, 0], [1.01, 8], [1.5, -5], [0.5, 0]]) {
+        const os = c.createOscillator();
+        os.type = 'sawtooth'; os.detune.value = det;
+        path(E, os.frequency, t, [70 * r * p, [105 * r * p, 0.3 * s], [58 * r * p, D]]);
+        os.connect(am); os.start(t); os.stop(t + D + 0.05);
+      }
+      lfo.start(t); lfo.stop(t + D + 0.05);
+      N(E, o, t, { ft: 'bandpass', f: 700 * p, q: 0.8, a: 0.1 * s, d: D, v: 0.3 });
+      T(E, o, t, { f: 50 * p, v: 0.4, a: 0.1, d: D * 0.9 });
+    },
+    screech(E, o, t, p) {
+      const D = 0.4 / Math.sqrt(p);
+      T(E, o, t, { type: 'sawtooth', fp: [850 * p, [1750 * p, D * 0.3], [700 * p, D]], v: 0.22, a: 0.015, d: D, flt: 'bandpass', ff: 2200, q: 1.2, lfo: [36, 90 * p] });
+      T(E, o, t + 0.01, { type: 'square', fp: [1300 * p, [2300 * p, D * 0.25], [900 * p, D]], v: 0.07, a: 0.015, d: D * 0.9, flt: 'lowpass', ff: 4000, lfo: [41, 120 * p] });
+      N(E, o, t, { ft: 'bandpass', f: 3200 * p, q: 2, a: 0.02, d: D, v: 0.14 });
+    },
+    step(E, o, t, p) {
+      footstep(E, o, t, p, 1);
+    },
+  };
+
+  // ---------------------------------------------------------------
+  // Live context, scheduler pump and the public API
+  // ---------------------------------------------------------------
+  let ctx = null, E = null, cur = null, wanted = null, timer = null, broken = !AC;
+  const lastSfx = {}, liveSfx = [];
+
+  function pump() {
+    try {
+      if (!ctx || ctx.state !== 'running' || !cur) return;
+      const now = ctx.currentTime, P = cur;
+      if (P.t0 + P.n * P.S.sd < now) { P.late++; P.t0 = now + 0.02 - P.n * P.S.sd; }  // stalled: skip ahead
+      tick(P, now + AHEAD);
+      if (P.nodes.length > 64) P.nodes = P.nodes.filter(x => x.end > now);
+      if (P.done && now > P.endT) {
+        try { P.out.disconnect(); } catch (_) { /* ignore */ }
+        cur = null;
+        if (wanted === P.name) wanted = null;
+      }
+    } catch (_) { /* never let the timer die */ }
+  }
+
+  function startMusic() {
+    if (!E || !wanted || !AU.musicOn || cur) return;
+    cur = makePlayer(E, wanted, ctx.currentTime + 0.12);
+  }
+
+  AU.unlock = () => {
+    try {
+      if (broken) return;
+      if (!ctx) {
+        try { ctx = new AC({ latencyHint: 'interactive' }); } catch (_) { ctx = new AC(); }
+        E = makeEngine(ctx);
+        // iOS: play one silent sample inside the gesture to wake the output
+        const b = ctx.createBuffer(1, 1, ctx.sampleRate), s = ctx.createBufferSource();
+        s.buffer = b; s.connect(ctx.destination); s.start(0);
+        timer = setInterval(pump, TICK_MS);
+      }
+      if (ctx.state !== 'running' && ctx.resume) {
+        const pr = ctx.resume();
+        if (pr && pr.catch) pr.catch(() => {});
+      }
+      startMusic();
+    } catch (_) {
+      broken = true; ctx = E = cur = null;
+      if (timer) clearInterval(timer);
+    }
+  };
+
+  AU.music = name => {
+    try {
+      name = name || null;
+      if (name && !SONG[name]) return;
+      wanted = name;
+      if (!E) return;
+      if (cur && cur.name === name && !cur.done) return;
+      if (cur) { stopPlayer(cur, FADE); cur = null; }
+      startMusic();
+    } catch (_) { /* ignore */ }
+  };
+
+  AU.sfx = (name, opts) => {
+    try {
+      if (!E || !AU.sfxOn || ctx.state !== 'running') return;
+      const fn = SFX[name];
+      if (!fn) return;
+      const now = ctx.currentTime;
+      if (lastSfx[name] && now - lastSfx[name] < 0.03) return;   // same sound twice in one frame
+      while (liveSfx.length && liveSfx[0] < now) liveSfx.shift();
+      if (liveSfx.length >= 14 && (name === 'tap' || name === 'step' || name === 'whoosh')) return;
+      lastSfx[name] = now;
+      const o = opts || {}, p = (o.pitch > 0 ? o.pitch : 1) * jitter();
+      const out = gain(ctx, (o.vol >= 0 ? Math.min(o.vol, 2) : 1) * (LVL[name] || 1));
+      out.connect(E.sfxBus);
+      fn(E, out, now + 0.005, p);
+      liveSfx.push(now + 1); liveSfx.sort((a, b) => a - b);
+    } catch (_) { /* ignore */ }
+  };
+
+  AU.setMusic = on => {
+    try {
+      AU.musicOn = !!on; saveSettings();
+      if (!AU.musicOn) { if (cur) { stopPlayer(cur, FADE); cur = null; } } else startMusic();
+    } catch (_) { /* ignore */ }
+  };
+  AU.setSfx = on => { AU.sfxOn = !!on; saveSettings(); };
+
+  // Suspend while hidden (timers are throttled in the background, and iOS
+  // suspends us anyway); resume when the page comes back.
+  try {
+    document.addEventListener('visibilitychange', () => {
+      try {
+        if (!ctx) return;
+        if (document.hidden) { if (ctx.state === 'running' && ctx.suspend) ctx.suspend().catch(() => {}); }
+        else AU.unlock();
+      } catch (_) { /* ignore */ }
+    });
+    window.addEventListener('pageshow', () => { if (ctx) AU.unlock(); });
+  } catch (_) { /* ignore */ }
+
+  // ---------------------------------------------------------------
+  // Test hooks (used by the offline harness, harmless in the game)
+  // ---------------------------------------------------------------
+  AU._render = (kind, name, secs, opts) => {
+    const o = opts || {}, sr = o.sr || 44100;
+    const c = new OAC(2, Math.ceil(sr * secs), sr), e = makeEngine(c);
+    if (kind === 'sfx') {
+      const out = gain(c, (o.vol == null ? 1 : o.vol) * (LVL[name] || 1));
+      out.connect(e.sfxBus);
+      SFX[name](e, out, 0.02, o.pitch || 1);
+    } else if (kind === 'note') {   // name = 'inst:midi'
+      const [i, m] = name.split(':');
+      INST[i]({ E: e, dest: e.musicBus, track: () => {} }, 0.02, +m, o.dur || 1, 1);
+    } else {
+      const P = makePlayer(e, name, 0.02, o.startStep || 0);
+      if (o.solo != null) P.solo = o.solo;
+      const t0 = performance.now();
+      tick(P, secs);
+      AU._schedMs = performance.now() - t0;
+    }
+    return c.startRendering();
+  };
+  AU._info = () => ({
+    errors: errors.slice(), sfx: Object.keys(SFX), inst: Object.keys(INST),
+    songs: Object.fromEntries(Object.entries(SONG).map(([k, s]) => [k, { bars: s.bars, bar: s.bar, total: s.total, sd: s.sd, loop: s.loop, channels: s.ch.length, loopSecs: s.total * s.sd }])),
+  });
+  AU._song = n => SONG[n];
+  AU._debug = () => ({
+    state: ctx ? ctx.state : 'none', time: ctx ? ctx.currentTime : 0, wanted,
+    playing: cur ? cur.name : null, step: cur ? cur.step : -1, steps: cur ? cur.n : 0,
+    nextT: cur ? cur.t0 + cur.n * cur.S.sd : 0, late: cur ? cur.late : 0, nodes: cur ? cur.nodes.length : 0,
+    ks: E ? E.ks.size : 0,
+  });
+  AU._tap = () => {   // live output meter for tests
+    if (!E) return null;
+    if (!E.an) { E.an = ctx.createAnalyser(); E.an.fftSize = 2048; E.out.connect(E.an); }
+    const d = new Float32Array(E.an.fftSize);
+    E.an.getFloatTimeDomainData(d);
+    let s = 0, pk = 0;
+    for (const x of d) { s += x * x; pk = Math.max(pk, Math.abs(x)); }
+    return { rms: Math.sqrt(s / d.length), peak: pk };
+  };
+})();
+
+</script>
+<script>
 // ---- 10_data.js ----
 // ================================================================
 // GAME DATA — edit these tables to customise the game.
@@ -14571,7 +15752,8 @@ var DW = window.DW = window.DW || {};
   });
 
   // Warm halo sprite blitted over a light source for flicker (sparse dither dots).
-  const haloSprite = (r, lv, col) => K.cached(`dw27|halo|${r}|${lv}|${col}`, r * 2 + 1, r * 2 + 1, S => {
+  const haloSprite = (r, lv, col) => haloQ(r, Math.round(clamp(lv, 0, 1) * 8) / 8, col);   // quantised: bounded cache
+  const haloQ = (r, lv, col) => K.cached(`dw27|halo|${r}|${lv}|${col}`, r * 2 + 1, r * 2 + 1, S => {
     for (let y = 0; y <= r * 2; y++) for (let x = 0; x <= r * 2; x++) {
       const d = Math.hypot(x - r, y - r) / (r + 0.5);
       if (d >= 1) continue;
@@ -14763,6 +15945,19 @@ var DW = window.DW = window.DW || {};
         const sA = n * 22;
         if (Math.abs(sA) < sEdge + 11) L.arches2.push({ s: sA, g: [0.5, 0, 0.8, 0.3, 0, 0.6][((n % 6) + 6) % 6] });
       }
+      // per-column lookups so the per-pixel pass stays cheap
+      L.pilD = new Float32Array(w); L.aisD = new Float32Array(w); L.g1 = new Float32Array(w); L.g2 = new Float32Array(w);
+      for (let x = 0; x < w; x++) {
+        const s0 = L.s[x];
+        let best = 1e9;
+        for (const p of L.pilasters) if (Math.abs(s0 - p) < Math.abs(best)) best = s0 - p;
+        L.pilD[x] = best;
+        let ab = 1e9;
+        for (const a2 of L.aisles) if (Math.abs(s0 - a2) < Math.abs(ab)) ab = s0 - a2;
+        L.aisD[x] = Math.abs(ab);
+        L.g1[x] = archGlow(L.arches1, s0, 30);
+        L.g2[x] = archGlow(L.arches2, s0, 22);
+      }
       // a moon over the rim when the stage is tall enough to show sky
       {
         const mx = Math.round(w * 0.2), skyH = L.yOf(mx, AZ.attic + 20);
@@ -14875,17 +16070,17 @@ var DW = window.DW = window.DW || {};
       if (as < 13 && z < 13 + Math.sqrt(Math.max(0, 169 - s * s))) {
         const r = Math.hypot(s, Math.max(0, z - 13));
         if (as < 9.5 && (z < 13 || r < 9.5)) {
-          // portcullis over a black passage with a faint ember glow deep inside
-          const bar = Math.abs(((s + 100) % 3.2) - 1.6) < 0.55;
+          // portcullis silhouetted against an ember glow from the pens deep inside
+          const glow = Math.max(0, 1 - Math.hypot(s / 9, (z - 2) / 15)) * (0.75 + 0.25 * vnoise(s * 0.4, z * 0.3, 71));
+          const sb = ((s + 100) % 3.2), bar = Math.abs(sb - 1.6) < 0.55;
           const rail = ((z + 100) % 5) < 1;
           if ((bar || rail) && z > 0.5) {
-            const left = ((s + 100) % 3.2) < 1.1;
-            M.b = bar && left ? 0.34 : 0.22; M.w = 0.05; M.lit = 0.6;
-            if (z < 2.5 && bar) M.b = 0.4;   // spike tips
+            M.b = bar && sb < 1.15 ? 0.2 : 0.1; M.w = 0.1; M.lit = 0.4;
+            if (z < 2.5 && bar) M.b = 0.3;
             return;
           }
-          M.lit = 0.15;
-          M.b = 0.05 + 0.1 * smooth(14, 0, z); M.w = 0.55;
+          M.lit = 0.1;
+          M.b = 0.06 + 0.5 * glow * glow; M.w = 0.5 + glow * 0.5;
           return;
         }
         // arch ring + jambs
@@ -14893,8 +16088,8 @@ var DW = window.DW = window.DW || {};
           const ang = Math.atan2(z - 13, s);
           const seg = ang / (Math.PI / 7);
           if (Math.abs(seg - Math.round(seg)) < 0.09 || r > 12.6) { M.b = 0.13; return; }
-          M.b = Math.abs(ang - Math.PI / 2) < 0.16 ? 0.46 : 0.36 - (s > 0 ? 0.05 : 0);
-          if (r < 10.5) M.b -= 0.06;
+          M.b = Math.abs(ang - Math.PI / 2) < 0.16 ? 0.5 : 0.42 - (s > 0 ? 0.06 : 0);
+          if (r < 10.5) { M.b = 0.3; M.w = 0.45; }
           return;
         }
         const zc = (z + 1) % 5;
@@ -14903,13 +16098,13 @@ var DW = window.DW = window.DW || {};
         return;
       }
       // pilasters
-      for (const p of L.pilasters) {
-        const d = s - p, ad = Math.abs(d);
+      {
+        const d = L.pilD[x], p = Math.round(s - d), ad = Math.abs(d);
         const wide = z < 3 || z > AZ.pod - 4;
         if (ad < (wide ? 5.5 : 4.5)) {
           const zc = (z + 2) % 8;
           if (zc < 1 || (wide && (z > 2 && z < 3 || z > AZ.pod - 4 && z < AZ.pod - 3))) { M.b = 0.13; return; }
-          M.b = 0.38 + hash2(Math.floor(z / 8), p | 0, 3) * 0.05;
+          M.b = 0.38 + hash2(Math.floor(z / 8), p | 0, 3) * 0.05 + (vnoise(s * 0.5, z * 0.4, 23) - 0.5) * 0.1;
           if (d < (wide ? -4.5 : -3.5)) M.b += 0.12;
           else if (d > (wide ? 3.5 : 2.5)) M.b -= 0.14;
           if (zc > 7) M.b += 0.06;
@@ -14922,7 +16117,7 @@ var DW = window.DW = window.DW || {};
       M.b = ashlar(POD_C[ci % POD_C.length], s, zc, 6, ci);
       M.b += (vnoise(s * 0.3, z * 0.45, 3) - 0.5) * 0.1;
       // cast shadow right of each pilaster, under the coping
-      for (const p of L.pilasters) { const d = s - p; if (d > 4.5 && d < 8) { M.b *= 0.62; break; } }
+      { const d = L.pilD[x]; if (d > 4.5 && d < 8) M.b *= 0.62; }
       if (z > AZ.pod - 3) M.b *= 0.72;
       // rain streaks and dried blood low on the wall
       const st = vnoise(s * 0.45, 0.5, 9);
@@ -14940,8 +16135,8 @@ var DW = window.DW = window.DW || {};
     }
     // ---------------- stands (crowd painted afterwards) ----------------
     if (z < AZ.stands) {
-      for (const a of L.aisles) {
-        const d = Math.abs(s - a);
+      {
+        const d = L.aisD[x];
         if (d < 3.5) { M.b = ((z + 400) % 2) < 1 ? 0.3 : 0.15; return; }
         if (d < 4.5) { M.b = 0.36; return; }
       }
@@ -14963,7 +16158,7 @@ var DW = window.DW = window.DW || {};
       if (ads < R && (z < zs || r < R)) {
         // gallery interior: a low parapet, then darkness with a warm back-glow
         if (z < 63) { M.b = z > 62 ? 0.32 : 0.2; M.lit = 0.5; return; }
-        const g = archGlow(L.arches1, s, 30);
+        const g = L.g1[x];
         M.lit = 0.2;
         M.b = 0.04 + g * 0.42 * smooth(zs + 6, 64, z) * (1 - 0.35 * (ads / R));
         M.w = 0.35 + g * 0.65;
@@ -15008,7 +16203,7 @@ var DW = window.DW = window.DW || {};
       const r = Math.hypot(ds, z - zs);
       if (ads < R && (z < zs || r < R) && z > AZ.cor1 + 1) {
         if (z < 113) { M.b = 0.24; M.lit = 0.5; return; }
-        const g = archGlow(L.arches2, s, 22);
+        const g = L.g2[x];
         M.lit = 0.2;
         M.b = 0.03 + g * 0.34 * smooth(zs + 4, 113, z);
         M.w = 0.3 + g * 0.6;
@@ -15055,6 +16250,14 @@ var DW = window.DW = window.DW || {};
     const sandBottom = h - L.floorC;
 
     const gore = new Uint8Array(w * h);
+    // blood stains that can touch each sand row (depth is nearly constant along a row)
+    const rowStains = [];
+    for (let y = 0; y < h; y++) {
+      const list = [];
+      const Dc = (L.floorC - yhF) / (y + 0.5 - yhF), De = (L.yF[0] - yhF) / (y + 0.5 - yhF);
+      for (const st0 of L.stains) if (Math.min(Math.abs(Dc - st0.D), Math.abs(De - st0.D)) < st0.rd * 1.7 + 0.01 || (st0.D > Math.min(Dc, De) && st0.D < Math.max(Dc, De))) list.push(st0);
+      rowStains.push(list);
+    }
     // ---------- per-pixel wall + floor ----------
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
@@ -15101,11 +16304,11 @@ var DW = window.DW = window.DW || {};
         const tl = torchLight(L, x, y, 2.4);
         b += 0.22 * tl; wm += 0.8 * tl;
         // grain, low mottling and faint wind ripples (finer with distance)
-        b += (hash2(x, y, 5) - 0.5) * 0.05 + (fbm(X * 0.05, D * 6, 13, 2) - 0.5) * 0.1;
+        b += (hash2(x, y, 5) - 0.5) * 0.05 + (vnoise(X * 0.05, D * 6, 13) - 0.5) * 0.11;
         b += 0.025 * Math.sin(D * 64 + vnoise(X * 0.04, D * 3, 8) * 5);
         // old blood soaked into the sand
         let g = 0, nz = -1;
-        for (const st0 of L.stains) {
+        for (const st0 of rowStains[y]) {
           const dx = (X - st0.X) / st0.rx;
           if (dx > 1.6 || dx < -1.6) continue;
           const dd = (D - st0.D) / st0.rd;
@@ -15509,10 +16712,8 @@ var DW = window.DW = window.DW || {};
   // Hue-shifted ramps: cool blue-violet shadows climbing to warm highlights,
   // so every prop sits in "firelight against the night" without extra work.
   const R_STEEL = ['#001', '#112', '#223', '#334', '#545', '#765', '#a86', '#dc9', '#ffd'];
-  const R_COLD = ['#001', '#012', '#123', '#234', '#346', '#568', '#89b', '#bce'];
   const R_WOOD = ['#000', '#100', '#210', '#320', '#431', '#642', '#863', '#a75'];
   const R_LEATH = ['#100', '#200', '#310', '#420', '#531', '#742', '#953'];
-  const R_SOOT = ['#000', '#101', '#111', '#212', '#322', '#432', '#643', '#854'];
   const R_BRASS = ['#100', '#210', '#430', '#640', '#861', '#b82', '#da4', '#fd7'];
 
   // Bayer-dithered pick along a single ramp, v in 0..1.
@@ -15560,125 +16761,153 @@ var DW = window.DW = window.DW || {};
     return remember(`sm|${w}x${h}`, () => {
       const L = { w, h };
       L.yF = h - 22;
-      L.hx0 = 3; L.hx1 = 73;
-      L.hTop = L.yF - 19; L.hoodBot = L.hTop - 23; L.hoodTop = L.hoodBot - 12;
-      L.cx0 = 24; L.cx1 = 52;
-      L.fire = { x: (L.hx0 + L.hx1) / 2, y: L.hTop - 4 };
-      L.win = { x0: w - 64, x1: w - 44, y0: Math.max(8, L.yF - 68), y1: L.yF - 44 };
-      L.anv = { x: w - 60, y: L.yF - 25 };
-      L.bar = { x0: w - 27, x1: w - 5, y0: L.yF - 17 };
-      L.rack = { x0: 98, x1: w - 96, y0: L.yF - 64, y1: L.yF - 30 };
+      L.fx0 = 2; L.fx1 = 80;                                   // forge body
+      L.bodyTop = L.yF - 45; L.hoodTop = L.bodyTop - 13;
+      L.cx0 = 27; L.cx1 = 55;                                  // chimney
+      L.m = { cx: 41, rx: 24, spring: L.yF - 24, ry: 13, ledge: L.yF - 13 };   // arched mouth
+      L.m.top = L.m.spring - L.m.ry;
+      L.fire = { x: L.m.cx, y: L.m.ledge - 6 };
+      L.win = { x0: w - 56, x1: w - 36, y0: Math.max(9, L.yF - 70), y1: L.yF - 47 };
+      L.anv = { x: w - 76, y: L.yF - 27 };
+      L.bar = { x0: w - 27, x1: w - 5, y0: L.yF - 18 };
+      L.rack = { x0: 96, x1: Math.max(118, w - 104), y0: L.yF - 66, y1: L.yF - 29 };
       return L;
     });
   }
+  const inMouth = (L, x, y) => {
+    const m = L.m, dx = (x + 0.5 - m.cx) / m.rx;
+    if (dx <= -1 || dx >= 1 || y >= m.ledge) return false;
+    return y + 0.5 >= m.spring - m.ry * Math.sqrt(1 - dx * dx);
+  };
 
   function paintSmithy(S, w, h) {
     const L = smithLayout(w, h);
-    const fx = L.fire.x, fy = L.fire.y;
+    const fx = L.fire.x, fy = L.fire.y, m = L.m;
     const W = L.win;
     const fireAt = (x, y) => {
-      const dx = x + 0.5 - fx, dy = (y + 0.5 - fy) * 1.1;
+      const dx = x + 0.5 - fx, dy = (y + 0.5 - fy) * 1.15;
       const d = Math.sqrt(dx * dx + dy * dy);
-      const a = Math.max(0, 1 - d / (w * 0.95));
-      return a * a * 1.1 + Math.max(0, 1 - d / 46) * 0.45;
+      const a = Math.max(0, 1 - d / (w * 0.92));
+      return a * a * 1.05 + Math.max(0, 1 - d / 44) * 0.4;
     };
-    // moonlight shaft from the window, falling down and to the left
     const shaftAt = (x, y) => {
       if (y < W.y1) return 0;
       const xw = x + 0.5 + (y + 0.5 - W.y1) * 0.62;
       if (xw < W.x0 + 2 || xw > W.x1 - 2) return 0;
       const edge = Math.min(xw - W.x0 - 2, W.x1 - 2 - xw) / 4;
-      return clamp(edge, 0, 1) * Math.max(0, 1 - (y - W.y1) / (L.yF - W.y1 + 20));
-    };
-    const hoodHalf = y => {   // half-width of the hood at row y (trapezoid narrowing to the chimney)
-      const t = clamp((y - L.hoodTop) / (L.hoodBot - L.hoodTop), 0, 1);
-      return { l: L.cx0 + (L.hx0 - 2 - L.cx0) * t, r: L.cx1 + (L.hx1 + 2 - L.cx1) * t };
+      return clamp(edge, 0, 1) * Math.max(0, 1 - (y - W.y1) / (L.yF - W.y1 + 24));
     };
 
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
       const lf = fireAt(x, y);
-      // ---- chimney and hood (soot-black brick, lit from below) ----
-      if (y < L.hoodBot) {
-        const hb = y < L.hoodTop ? { l: L.cx0, r: L.cx1 } : hoodHalf(y);
-        if (x >= hb.l && x < hb.r) {
-          const lip = y >= L.hoodBot - 4;
+      // ---- chimney + hood: soot-black brick, the hood lip lit from below ----
+      if (y < L.bodyTop) {
+        let l = L.cx0, r = L.cx1;
+        if (y >= L.hoodTop) {
+          const t = (y - L.hoodTop) / (L.bodyTop - L.hoodTop);
+          l = L.cx0 + (L.fx0 - L.cx0) * t; r = L.cx1 + (L.fx1 - L.cx1) * t;
+        }
+        if (x >= l - 0.5 && x < r + 0.5) {
           const row = Math.floor(y / 4), off = (row & 1) * 4;
           const mortar = (y % 4 === 3) || ((x + off) % 9 === 0);
-          let b = mortar ? 0.14 : 0.3 + hash2((x + off) / 9 | 0, row, 3) * 0.08;
-          if (x < hb.l + 1.5) b += 0.08;                     // lit left edge
-          if (x > hb.r - 2.5) b -= 0.1;
-          b += (vnoise(x * 0.2, y * 0.2, 7) - 0.5) * 0.1;
-          if (lip) { b = y === L.hoodBot - 4 ? 0.3 : 0.42 + (y - (L.hoodBot - 4)) * 0.12; }
-          const up = lip ? 1.2 : 0.55 * Math.max(0, 1 - (L.hoodBot - y) / 30);
-          S.set(x, y, pick(SM_WALL, b * (0.3 + lf * 0.6 + up), 0.25 + lf * 0.7 + up * 0.4, x, y));
+          let b = mortar ? 0.12 : 0.27 + hash2((x + off) / 9 | 0, row, 3) * 0.08;
+          if (x < l + 1.5) b += 0.1;
+          else if (x > r - 1.5) b -= 0.08;
+          if (y >= L.hoodTop && y < L.hoodTop + 2) b = y === L.hoodTop ? 0.45 : 0.2;   // hood shoulder ledge
+          b += (vnoise(x * 0.2, y * 0.2, 7) - 0.5) * 0.08;
+          const up = y >= L.hoodTop ? 0.5 * (y - L.hoodTop) / (L.bodyTop - L.hoodTop) : 0;
+          S.set(x, y, pick(SM_WALL, b * (0.35 + lf * 0.55 + up), 0.2 + lf * 0.6 + up * 0.5, x, y));
           continue;
         }
       }
-      // ---- forge mouth: jambs, glowing firebrick, coals ----
-      if (y >= L.hoodBot && y < L.hTop && x >= L.hx0 && x < L.hx1) {
-        if (x < L.hx0 + 4 || x >= L.hx1 - 4) {
-          const left = x < L.hx0 + 4;
-          let b = (y % 6 === 5) ? 0.15 : 0.38;
-          b += left ? (x === L.hx0 ? 0.1 : x === L.hx0 + 3 ? 0.18 : 0) : (x === L.hx1 - 4 ? 0.22 : x === L.hx1 - 1 ? -0.1 : 0);
-          S.set(x, y, pick(SM_WALL, b * (0.4 + lf * 0.9), 0.4 + lf, x, y));
+      // ---- forge body ----
+      if (x >= L.fx0 && x < L.fx1 && y >= L.bodyTop && y < L.yF) {
+        // the arched mouth: firebrick glowing hotter toward the coals
+        if (inMouth(L, x, y)) {
+          const t = (y - m.top) / (m.ledge - m.top);
+          const row = Math.floor(y / 3), off = (row & 1) * 3;
+          const mortar = (y % 3 === 2) || ((x + off) % 6 === 0);
+          const side = Math.abs(x + 0.5 - m.cx) / m.rx;
+          const b = (mortar ? 0.3 : 0.5) * (0.25 + t * 0.8) * (1 - side * 0.35);
+          S.set(x, y, pick(SM_WALL, b, 0.75 + t * 0.25, x, y));
           continue;
         }
-        const t = (y - L.hoodBot) / (L.hTop - L.hoodBot);     // 0 top → 1 at the coals
-        const row = Math.floor(y / 3), off = (row & 1) * 3;
-        const mortar = (y % 3 === 2) || ((x + off) % 6 === 0);
-        let b = (mortar ? 0.35 : 0.55) * (0.35 + t * 0.85);
-        S.set(x, y, pick(SM_WALL, b, 0.7 + t * 0.3, x, y));
-        continue;
-      }
-      // ---- hearth: brick front, stone slab top ----
-      if (y >= L.hTop && y < L.yF && x >= L.hx0 - 1 && x < L.hx1 + 1) {
-        if (y < L.hTop + 3) {
-          let b = y === L.hTop ? 0.62 : y === L.hTop + 1 ? 0.48 : 0.22;
-          if (x === L.hx0 - 1) b += 0.1;
-          S.set(x, y, pick(SM_WALL, b * (0.6 + lf * 0.6), 0.55 + lf * 0.5, x, y));
+        // voussoirs ringing the mouth
+        const dx = (x + 0.5 - m.cx), dy = (y + 0.5 - m.spring);
+        const rr = Math.hypot(dx / (m.rx + 5), Math.min(0, dy) / (m.ry + 5));
+        const ringIn = Math.hypot(dx / m.rx, Math.min(0, dy) / m.ry);
+        if (y < m.ledge && rr < 1 && ringIn >= 1) {
+          const ang = Math.atan2(Math.min(0, dy) / (m.ry + 2), dx / (m.rx + 2));
+          const seg = ang / (Math.PI / 9);
+          const joint = Math.abs(seg - Math.round(seg)) < 0.12 || rr > 0.93;
+          const inner = ringIn < 1.08;
+          const key = Math.abs(ang + Math.PI / 2) < 0.17;
+          let b = joint ? 0.14 : key ? 0.5 : 0.4;
+          if (dx > 0 && !joint) b -= 0.06;
+          S.set(x, y, pick(SM_WALL, inner && !joint ? 0.62 : b * (0.45 + lf * 0.8), inner ? 1 : 0.4 + lf * 0.7, x, y));
           continue;
         }
-        const row = Math.floor((y - L.hTop - 3) / 4), off = (row & 1) * 5;
-        const mortar = ((y - L.hTop - 3) % 4 === 3) || ((x + off) % 10 === 0);
-        let b = mortar ? 0.12 : 0.36 + hash2((x + off) / 10 | 0, row, 5) * 0.1;
-        if ((y - L.hTop - 3) % 4 === 0 && !mortar) b += 0.08;
-        b *= 1 - (y - L.hTop) / (L.yF - L.hTop) * 0.35;
-        if (x <= L.hx0) b += 0.06; if (x >= L.hx1 - 1) b -= 0.08;
-        S.set(x, y, P.rampF(R_SOOT, clamp(b * (0.5 + lf * 0.9), 0, 1), x, y) === '#000' ? '#000' : pick(SM_WALL, b * (0.45 + lf * 0.75), 0.45 + lf * 0.6, x, y));
+        // hearth ledge in front of the coals
+        if (y >= m.ledge && y < m.ledge + 3 && Math.abs(x + 0.5 - m.cx) < m.rx + 3) {
+          const b = y === m.ledge ? 0.7 : y === m.ledge + 1 ? 0.5 : 0.18;
+          S.set(x, y, pick(SM_WALL, b, 0.85, x, y));
+          continue;
+        }
+        // ash pit with a dull red glow
+        const ap = Math.hypot((x + 0.5 - m.cx) / 7, Math.min(0, y + 0.5 - (L.yF - 4)) / 4);
+        if (y > m.ledge + 4 && ap < 1) {
+          const t = (y - (L.yF - 8)) / 8;
+          S.set(x, y, rampPick(['#000', '#100', '#200', '#300', '#410', '#620'], 0.15 + t * 0.6 + (hash2(x, y, 4) > 0.8 ? 0.2 : 0), x, y));
+          continue;
+        }
+        // mantel ledge on top of the body
+        if (y < L.bodyTop + 3) {
+          const b = y === L.bodyTop ? 0.55 : y === L.bodyTop + 1 ? 0.42 : 0.14;
+          S.set(x, y, pick(SM_WALL, b * (0.5 + lf * 0.7), 0.35 + lf * 0.6, x, y));
+          continue;
+        }
+        // ashlar
+        const ci = Math.floor((y - L.bodyTop - 3) / 6), zc = (y - L.bodyTop - 3) - ci * 6;
+        let b = ashlar(POD_C[ci % POD_C.length], x * 1.1 + 40, 5 - zc, 6, ci + 300);
+        if (x < L.fx0 + 1) b += 0.08;
+        if (x >= L.fx1 - 1) b -= 0.1;
+        b += (vnoise(x * 0.3, y * 0.3, 11) - 0.5) * 0.08;
+        S.set(x, y, pick(SM_WALL, b * (0.4 + lf * 0.75), 0.3 + lf * 0.65, x, y));
         continue;
       }
       // ---- ceiling beam ----
       if (y < 6) {
-        let b = y === 5 ? 0.15 : y === 4 ? 0.42 : 0.3 + (y === 0 ? -0.1 : 0);
+        let b = y === 5 ? 0.12 : y === 4 ? 0.4 : 0.28 + (y === 0 ? -0.08 : 0);
         b += (vnoise(x * 0.15, y, 4) - 0.5) * 0.12;
         if ((x + 7) % 41 === 0 && y === 2) b = 0.7;
-        S.set(x, y, rampPick(R_WOOD, b * (0.5 + lf * 0.9), x, y));
+        S.set(x, y, rampPick(R_WOOD, b * (0.55 + lf * 0.9), x, y));
         continue;
       }
-      // ---- the window: stone frame, bars, deep blue night ----
+      // ---- window ----
       if (x >= W.x0 - 2 && x < W.x1 + 2 && y >= W.y0 - 2 && y < W.y1 + 2) {
         const r = (W.x1 - W.x0) / 2, cxw = (W.x0 + W.x1) / 2, ya = W.y0 + r;
-        const inArch = y >= ya || Math.hypot(x + 0.5 - cxw, y + 0.5 - ya) < r;
-        const inFrame = y >= ya - 2 || Math.hypot(x + 0.5 - cxw, y + 0.5 - ya) < r + 2;
+        const dArch = Math.hypot(x + 0.5 - cxw, y + 0.5 - ya);
+        const inArch = y >= ya || dArch < r;
+        const inFrame = y >= ya - 2 || dArch < r + 2;
         if (inArch && x >= W.x0 && x < W.x1 && y < W.y1) {
           const bar = (x - W.x0) % 5 === 2 || (y - W.y0) % 7 === 6;
-          if (bar) S.set(x, y, (x - W.x0) % 5 === 2 && x - W.x0 < 10 ? '#112' : '#101');
+          if (bar) S.set(x, y, '#101');
           else {
-            const v = 0.3 + (1 - (y - W.y0) / (W.y1 - W.y0)) * 0.35 + (x - W.x0) / (W.x1 - W.x0) * 0.2;
+            const v = 0.25 + (1 - (y - W.y0) / (W.y1 - W.y0)) * 0.35 + (x - W.x0) / (W.x1 - W.x0) * 0.2;
             S.set(x, y, rampPick(['#012', '#123', '#134', '#245', '#357'], v, x, y));
-            if (hash2(x, y, 33) > 0.96) S.set(x, y, '#68a');
+            if (hash2(x, y, 33) > 0.95) S.set(x, y, '#68a');
           }
           continue;
         }
         if (inFrame) {
           const sill = y >= W.y1;
-          let b = sill ? (y === W.y1 ? 0.6 : 0.3) : (x < cxw ? 0.4 : 0.26);
-          S.set(x, y, pick(SM_WALL, b * (0.5 + lf * 0.6) + 0.1, 0.15 + lf * 0.4, x, y));
+          const b = sill ? (y === W.y1 ? 0.6 : 0.28) : (x < cxw ? 0.42 : 0.26);
+          S.set(x, y, pick(SM_WALL, b * (0.55 + lf * 0.5) + 0.08, 0.12 + lf * 0.4, x, y));
           continue;
         }
       }
-      // ---- floor: flagstones ----
       const sh = shaftAt(x, y);
+      // ---- floor: flagstones ----
       if (y >= L.yF) {
         const yy = y - L.yF;
         const rows = [0, 4, 9, 15, 22, 30, 40];
@@ -15690,171 +16919,875 @@ var DW = window.DW = window.DW || {};
         if (ry === rh - 1 || lx < 1) b = 0.1;
         else if (ry === 0) b += 0.1;
         b += (hash2(x, y, 8) - 0.5) * 0.06;
-        if (yy < 2) b *= 0.6;
+        if (yy < 2) b *= 0.55;
         S.set(x, y, pick(SM_WALL, b * (0.35 + lf * 1.1) + sh * 0.3, 0.12 + lf * 1.1 - sh * 0.6, x, y));
         continue;
       }
-      // ---- back wall: rough stone, soot above the forge ----
+      // ---- back wall ----
       let b = roughStone(x, y, 7, 3);
-      const soot = Math.max(0, 1 - Math.hypot(x - (L.cx0 + L.cx1) / 2, (y - L.hoodTop) * 0.6) / 70);
-      b *= 1 - soot * 0.5;
-      S.set(x, y, pick(SM_WALL, b * (0.32 + lf * 1.0) + sh * 0.22, 0.12 + lf * 1.1 - sh * 0.7, x, y));
+      const soot = Math.max(0, 1 - Math.hypot(x - (L.cx0 + L.cx1) / 2, (y - L.hoodTop) * 0.6) / 64);
+      b *= 1 - soot * 0.55;
+      S.set(x, y, pick(SM_WALL, b * (0.3 + lf * 1.0) + sh * 0.22, 0.12 + lf * 1.1 - sh * 0.7, x, y));
     }
 
-    // ---- coal bed (static base; the flames dance above it) ----
-    for (let y = L.hTop - 5; y < L.hTop; y++) for (let x = L.hx0 + 5; x < L.hx1 - 5; x++) {
-      const k = (x - (L.hx0 + 5)) / (L.hx1 - L.hx0 - 10);
-      const top = L.hTop - 1 - Math.sin(k * Math.PI) * 4 - (vnoise(x * 0.5, 1, 8) - 0.5) * 2;
+    // ---- coal bed inside the mouth ----
+    for (let y = m.ledge - 5; y < m.ledge; y++) for (let x = m.cx - m.rx + 2; x < m.cx + m.rx - 2; x++) {
+      const k = (x - (m.cx - m.rx + 2)) / (2 * m.rx - 4);
+      const top = m.ledge - 1 - Math.sin(k * Math.PI) * 4 - (vnoise(x * 0.5, 1, 8) - 0.5) * 2;
       if (y + 0.5 < top) continue;
       const n = vnoise(x * 0.7, y * 0.9, 12);
-      const hot = n > 0.55 ? 6 : n > 0.42 ? 4 : n > 0.3 ? 2 : 1;
-      S.set(x, y, FIRE[clamp(hot + (y > L.hTop - 2 ? 1 : 0) + (TH(x, y) > 0.7 ? -1 : 0), 1, 7)]);
+      const hot = n > 0.56 ? 6 : n > 0.43 ? 4 : n > 0.3 ? 2 : 1;
+      S.set(x, y, FIRE[clamp(hot + (y > m.ledge - 2 ? 1 : 0) + (TH(x, y) > 0.7 ? -1 : 0), 1, 7)]);
     }
 
-    // ---- racks of blades on the back wall ----
+    // ---- racks of blades ----
     const RK = L.rack;
+    const lightL = [-0.85, -0.3, 0.45];
+    const BLADE = ['#101', '#112', '#223', '#334', '#445', '#556', '#778', '#998', '#cb9'];
     layer(S, T => {
-      const n = Math.max(3, Math.floor((RK.x1 - RK.x0 - 6) / 9));
-      const sp = (RK.x1 - RK.x0 - 6) / Math.max(1, n - 1);
-      const rnd = U.rng(77);
+      const n = Math.max(3, Math.floor((RK.x1 - RK.x0) / 11) + 1);
+      const sp = (RK.x1 - RK.x0) / Math.max(1, n - 1);
+      const mid = n >= 7 ? Math.floor(n / 2) : -9;
       for (let i = 0; i < n; i++) {
-        const x = Math.round(RK.x0 + 3 + i * sp);
-        const kind = i % 4;
-        const top = RK.y0 + 2 + Math.floor(rnd() * 3), len = RK.y1 - top - 2 - (kind === 2 ? 4 : 0);
-        const lit = clamp(1.25 - (x - fx) / (w * 0.9), 0.35, 1);
-        const hi = Math.round(4 + lit * 4), bw = kind === 1 ? 1.7 : 1.2;
-        // blade (point down)
-        T.capsule(x, top + 6, x, top + len - 2, bw, bw * 0.75, R_STEEL, { hi, spec: 0.6, light: K.norm3([-0.8, -0.3, 0.5]) });
-        T.tri([x - bw, top + len - 2], [x + bw + 0.5, top + len - 2], [x + 0.25, top + len + 1.5], R_STEEL, { tone: 0.45, hi });
-        T.line(x, top + 7, x, top + len - 2, R_STEEL[Math.min(hi, 6)]);   // fuller glint
-        // guard, grip, pommel
-        const gc = kind === 3 ? R_BRASS : R_STEEL;
-        T.capsule(x - 3.2, top + 5, x + 3.2, top + 5, 0.9, 0.9, gc, { hi: hi - 1 });
-        T.capsule(x, top + 1.5, x, top + 4, 0.8, 0.8, R_LEATH, { hi: 5 });
-        T.ball(x, top + 1, 1.2, 1.2, kind === 0 ? R_BRASS : R_STEEL, { hi: hi - 1 });
+        if (i === mid) continue;
+        const x = Math.round(RK.x0 + i * sp);
+        const kind = (i * 7 + 3) % 4;
+        const top = RK.y0 + (kind === 1 ? 0 : kind === 2 ? 4 : 2);
+        const len = RK.y1 - top - (kind === 3 ? 5 : 1);
+        const lit = clamp(1.25 - (x - fx) / (w * 0.8), 0.3, 1);
+        const bw = kind === 1 ? 2.1 : kind === 2 ? 1.5 : 1.7;
+        const y0 = top + 8, y1 = top + len - 3;
+        for (let y = y0; y <= y1 + 3; y++) {
+          const k = y > y1 ? (y1 + 3.5 - y) / 3.5 : 1;          // tapering point
+          const half = Math.max(0.5, bw * k);
+          for (let xx = Math.floor(x - half); xx <= Math.ceil(x + half) - 1; xx++) {
+            const u0 = (xx + 0.5 - x) / half;                     // -1 left edge … 1 right edge
+            let v = u0 < -0.5 ? 0.55 + lit * 0.35 : u0 < 0 ? 0.42 : Math.abs(u0) < 0.3 ? 0.3 : 0.22;
+            if (Math.abs(u0) < 0.25 && y > y0 + 1 && y < y1 - 2) v = 0.18;   // fuller groove
+            T.set(xx, y, rampPick(BLADE, v * (0.6 + lit * 0.5), xx, y));
+          }
+        }
+        const gc = kind === 3 || kind === 0 ? R_BRASS : R_STEEL;
+        const hi = Math.round(3 + lit * 4);
+        T.capsule(x - 4.2, top + 7, x + 4.2, top + 7, 1, 1, gc, { hi });
+        T.capsule(x, top + 2.5, x, top + 5.5, 1, 1, R_LEATH, { hi: 5 });
+        T.ball(x, top + 1.5, 1.5, 1.5, gc, { hi });
       }
-      // the rack itself: two rails on iron brackets
-      for (const ry of [RK.y0 + 6, RK.y1 - 6]) {
-        T.capsule(RK.x0 - 2, ry, RK.x1 + 2, ry, 1.4, 1.4, R_WOOD, { hi: 6, light: K.norm3([-0.6, -0.6, 0.5]) });
+      for (const ry of [RK.y0 + 9, RK.y1 - 5]) T.capsule(RK.x0 - 5, ry, RK.x1 + 5, ry, 1.3, 1.3, R_WOOD, { hi: 6 });
+      if (mid >= 0) {
+        // a round shield hung over the middle of the rack: planks, iron rim, boss, a painted chevron
+        const sx = RK.x0 + mid * sp, sy = (RK.y0 + RK.y1) / 2 + 1, sr = 9;
+        T.ball(sx, sy, sr, sr, R_WOOD, { hi: 6, depth: 0.35 });
+        T.recolor((px, py) => Math.hypot(px + 0.5 - sx, py + 0.5 - sy) < sr - 1.5 && Math.abs((py + 0.5 - sy) + Math.abs(px + 0.5 - sx) * 0.7 - 1) < 2.2,
+          (hx, px, py) => (px < sx ? '#a32' : '#712'));
+        T.recolor((px, py) => { const d = Math.hypot(px + 0.5 - sx, py + 0.5 - sy); return d >= sr - 1.5 && d < sr + 0.7; }, (hx, px, py) => (px + py < sx + sy ? '#778' : '#334'));
+        T.ball(sx, sy, 2.4, 2.4, R_STEEL, { hi: 7, spec: 0.7 });
       }
-    }, { light: [-0.8, -0.3, 0.5] });
+    }, { light: lightL });
 
-    // ---- axes and a shield hung on the wall right of the rack ----
+    // ---- crossed axes beside the rack ----
     layer(S, T => {
-      const ax = RK.x1 + 12, ay = RK.y0 + 4;
-      // crossed axes
+      const ax = RK.x1 + 17, ay = RK.y0 + 4;
+      const lit = clamp(1.2 - (ax - fx) / (w * 0.8), 0.3, 1), hi = Math.round(3 + lit * 3);
       for (const sd of [-1, 1]) {
-        T.capsule(ax - sd * 8, ay + 22, ax + sd * 6, ay, 1.1, 1.1, R_WOOD, { hi: 6 });
+        T.capsule(ax - sd * 9, ay + 26, ax + sd * 6, ay + 1, 1.2, 1.2, R_WOOD, { hi: 6 });
         const hx = ax + sd * 6, hy = ay + 2;
-        T.poly([[hx, hy - 3], [hx + sd * 6, hy - 6], [hx + sd * 7.5, hy + 1], [hx + sd * 6, hy + 6], [hx, hy + 3]], R_STEEL, { grad: [hx - 3, hy - 5, hx + 6, hy + 6, 0.85, 0.35], hi: 7 });
+        T.poly([[hx, hy - 3], [hx + sd * 5, hy - 7], [hx + sd * 8.5, hy - 1], [hx + sd * 8, hy + 4], [hx + sd * 5, hy + 7], [hx, hy + 3]], BLADE, { grad: [hx - 2, hy - 6, hx + 6, hy + 6, 0.75, 0.25] });
+        T.line(hx + sd * 8, hy - 1, hx + sd * 7.5, hy + 4, BLADE[hi + 1]);
       }
-      // round shield behind them
-    }, { light: [-0.8, -0.3, 0.5] });
+    }, { light: lightL });
 
-    // ---- bellows feeding the forge ----
+    // ---- tongs hung on a nail by the window (when there is room) ----
     layer(S, T => {
-      const bx = L.hx1 - 1, by = L.hTop + 6;
-      // leather pleats between two boards (wedge pointing left into the hearth)
-      const pts = [[bx, by], [bx + 26, by - 7], [bx + 28, by + 7], [bx, by + 2]];
-      T.poly(pts, R_LEATH, { grad: [bx, by - 6, bx, by + 7, 0.85, 0.25] });
-      for (let i = 1; i < 6; i++) {
-        const xx = bx + 3 + i * 4;
-        T.line(xx, by - (xx - bx) * 0.26 + 1, xx + 1, by + 2 + (xx - bx) * 0.18 - 1, '#310');
-      }
-      T.capsule(bx, by - 0.5, bx + 27, by - 7.5, 1.3, 1.6, R_WOOD, { hi: 7 });    // top board
-      T.capsule(bx, by + 2, bx + 28, by + 7.5, 1.2, 1.5, R_WOOD, { hi: 5 });       // bottom board
-      T.capsule(bx - 5, by + 1, bx + 1, by + 1, 1.2, 1.5, R_STEEL, { hi: 7 });    // nozzle into the fire
-      T.capsule(bx + 26, by - 8, bx + 34, by - 15, 0.9, 0.9, R_WOOD, { hi: 6 });  // handle
-    }, { light: [-0.9, -0.2, 0.45] });
+      const gx0 = RK.x1 + 29, gx1 = W.x0 - 3;
+      if (gx1 - gx0 < 16) return;
+      const tx = Math.round((gx0 + gx1) / 2), ty = L.yF - 66;
+      T.capsule(tx - 1, ty, tx - 3, ty + 15, 0.7, 0.7, R_STEEL, { hi: 5 });
+      T.capsule(tx + 1, ty, tx + 3, ty + 15, 0.7, 0.7, R_STEEL, { hi: 4 });
+      T.ball(tx, ty + 0.5, 1.4, 1.2, R_STEEL, { hi: 5 });
+    }, { light: lightL });
 
-    // ---- anvil on a stump, a hot blade and a hammer ----
+    // ---- bellows feeding the forge: teardrop boards, pleated leather, brass nozzle ----
+    layer(S, T => {
+      const bx = L.fx1 + 4, by = L.yF - 14;
+      const drop = (dy, sc) => [[0, 0], [7, -3], [15, -6], [23, -7.5], [29, -6.5], [32, -3], [31.5, 1], [28, 3.5], [20, 4], [11, 3], [4, 1.5]]
+        .map(([px, py]) => [bx + px, by + dy + py * sc]);
+      T.poly(drop(6, 0.9), R_WOOD, { tone: 0.25 });                                    // bottom board
+      T.poly(drop(4.5, 1), R_LEATH, { grad: [bx, by - 2, bx, by + 10, 0.65, 0.15] });   // leather sides
+      for (let i = 0; i < 3; i++) {
+        const pl = drop(2 + i * 1.5, 1);
+        for (let k = 3; k < 9; k++) T.line(pl[k][0], pl[k][1], pl[k + 1][0], pl[k + 1][1], i === 1 ? '#742' : '#531');
+      }
+      T.poly(drop(0, 1), R_WOOD, { grad: [bx, by - 7, bx + 30, by + 3, 0.95, 0.35] });   // top board
+      T.line(bx + 8, by - 2, bx + 27, by - 5, '#310');                                  // grain
+      T.ball(bx + 22, by - 2, 2, 1.3, R_BRASS, { hi: 7 });                              // valve plate
+      T.capsule(bx - 6, by + 2, bx + 2, by + 1.5, 1.2, 1.6, R_BRASS, { hi: 7, spec: 0.6 });   // nozzle
+      T.capsule(bx + 31, by - 2, bx + 37, by - 9, 1, 1, R_WOOD, { hi: 6 });              // handle
+      T.ball(bx + 37.5, by - 9.5, 1.5, 1.5, R_WOOD, { hi: 7 });
+    }, { light: [-0.8, -0.4, 0.45] });
+
+    // ---- the anvil on its stump, a hot blade, a hammer ----
     layer(S, T => {
       const ax = L.anv.x, ay = L.anv.y;
       // stump
-      T.poly([[ax - 9, ay + 9], [ax + 9, ay + 9], [ax + 10, L.yF + 4], [ax - 10, L.yF + 4]], R_WOOD, { grad: [ax - 10, 0, ax + 10, 0, 0.75, 0.2] });
-      for (let i = -6; i <= 6; i += 4) T.line(ax + i, ay + 11, ax + i + (i > 0 ? 1 : 0), L.yF + 3, '#210');
-      T.ellipse(ax, ay + 9, 9, 1.6, '#531');
-      T.capsule(ax - 10, ay + 14, ax + 10, ay + 14, 0.8, 0.8, R_STEEL, { hi: 5 });
-      // anvil: feet, waist, body, horn
-      T.poly([[ax - 9, ay + 9], [ax - 6, ay + 6], [ax + 6, ay + 6], [ax + 9, ay + 9]], R_STEEL, { tone: 0.35, hi: 7 });
-      T.poly([[ax - 4, ay + 6], [ax - 5, ay + 3], [ax + 6, ay + 3], [ax + 4, ay + 6]], R_STEEL, { grad: [ax - 5, 0, ax + 6, 0, 0.7, 0.25], hi: 7 });
-      T.poly([[ax - 9, ay - 2], [ax + 12, ay - 2], [ax + 11, ay + 3], [ax - 7, ay + 3]], R_STEEL, { grad: [ax - 9, ay - 2, ax + 12, ay + 3, 0.85, 0.3], hi: 8 });
-      T.horn(ax - 9, ay - 1, ax - 15, ay - 0.5, ax - 20, ay - 2.5, 2.4, 0.6, R_STEEL, { hi: 8, spec: 0.6 });
-      T.rect(ax - 9, ay - 2, 21, 1, '#dc9');                     // the face catches the firelight
-      T.rect(ax + 4, ay - 2, 8, 1, '#a86');
-      // a blade fresh from the fire, glowing on the face
-      T.capsule(ax - 7, ay - 3.5, ax + 6, ay - 3, 0.9, 0.7, ['#300', '#610', '#920', '#c40', '#e70', '#fa2', '#fd5'], { tone: 0.75 });
-      T.rect(ax - 5, ay - 4, 8, 1, '#fd5');
-      // hammer resting on the heel
-      T.capsule(ax + 6, ay - 4, ax + 17, ay - 10, 0.9, 0.8, R_WOOD, { hi: 6 });
-      T.poly([[ax + 3, ay - 7], [ax + 9, ay - 7], [ax + 9, ay - 3], [ax + 3, ay - 3]], R_STEEL, { grad: [ax + 3, ay - 7, ax + 9, ay - 3, 0.8, 0.3], hi: 7 });
+      T.poly([[ax - 11, ay + 12], [ax + 11, ay + 12], [ax + 12, L.yF + 4], [ax - 12, L.yF + 4]], R_WOOD, { grad: [ax - 12, 0, ax + 12, 0, 0.8, 0.15] });
+      for (let i = -8; i <= 8; i += 4) T.line(ax + i, ay + 14, ax + i + (i > 0 ? 1 : 0), L.yF + 3, '#210');
+      T.ellipse(ax, ay + 12, 11, 1.8, '#642');
+      T.capsule(ax - 12, ay + 18, ax + 12, ay + 18, 0.9, 0.9, R_STEEL, { hi: 5 });
+      // anvil: feet, waist, body, horn, heel
+      T.poly([[ax - 11, ay + 12], [ax - 8, ay + 8], [ax + 9, ay + 8], [ax + 12, ay + 12]], R_STEEL, { grad: [ax - 11, 0, ax + 12, 0, 0.6, 0.15], hi: 7 });
+      T.poly([[ax - 5, ay + 8], [ax - 6, ay + 4], [ax + 7, ay + 4], [ax + 6, ay + 8]], R_STEEL, { grad: [ax - 6, 0, ax + 7, 0, 0.65, 0.15], hi: 7 });
+      T.poly([[ax - 11, ay - 3], [ax + 15, ay - 3], [ax + 14, ay + 1], [ax + 9, ay + 4], [ax - 8, ay + 4], [ax - 10, ay + 1]], R_STEEL, { grad: [ax - 11, ay - 3, ax + 14, ay + 4, 0.8, 0.2], hi: 8 });
+      T.horn(ax - 11, ay - 1.5, ax - 18, ay - 1, ax - 25, ay - 4, 3, 0.6, R_STEEL, { hi: 8, spec: 0.7 });
+      T.rect(ax - 11, ay - 3, 26, 1, '#dc9');
+      T.rect(ax + 5, ay - 3, 10, 1, '#a86');
+      T.rect(ax - 10, ay - 2, 3, 1, '#765');
+      // a blade fresh from the fire
+      T.capsule(ax - 9, ay - 4.5, ax + 8, ay - 4, 1.1, 0.8, ['#300', '#610', '#920', '#c40', '#e70', '#fa2', '#fd5'], { tone: 0.72 });
+      T.capsule(ax + 8, ay - 4, ax + 14, ay - 4.5, 0.8, 0.8, R_STEEL, { hi: 6 });
+      // hammer leaning on the heel
+      T.capsule(ax + 9, ay - 5, ax + 22, ay - 13, 1, 0.9, R_WOOD, { hi: 6 });
+      T.poly([[ax + 5, ay - 9], [ax + 12, ay - 9], [ax + 12, ay - 4], [ax + 5, ay - 4]], R_STEEL, { grad: [ax + 5, ay - 9, ax + 12, ay - 4, 0.85, 0.25], hi: 7 });
     }, { light: [-0.85, -0.25, 0.5] });
 
     // ---- quench barrel ----
     layer(S, T => {
       const { x0, x1, y0 } = L.bar, cx = (x0 + x1) / 2, rx = (x1 - x0) / 2;
-      T.poly([[x0, y0], [x1, y0], [x1 - 1, L.yF + 5], [x0 + 1, L.yF + 5]], R_WOOD, { grad: [x0, 0, x1, 0, 0.7, 0.2] });
-      for (let x = x0 + 3; x < x1 - 1; x += 4) T.line(x, y0 + 2, x, L.yF + 4, '#210');
-      for (const yy of [y0 + 4, y0 + 13]) T.capsule(x0, yy, x1, yy, 0.8, 0.8, R_STEEL, { hi: 5 });
+      T.poly([[x0, y0], [x1, y0], [x1 - 1, L.yF + 5], [x0 + 1, L.yF + 5]], R_WOOD, { grad: [x0, 0, x1, 0, 0.62, 0.15] });
+      for (let x = x0 + 3; x < x1 - 1; x += 4) T.line(x, y0 + 2, x, L.yF + 4, '#100');
+      for (const yy of [y0 + 4, y0 + 14]) T.capsule(x0, yy, x1, yy, 0.8, 0.8, R_STEEL, { hi: 5 });
       T.ellipse(cx, y0, rx, 2, '#320');
       T.ellipse(cx, y0 + 0.5, rx - 1.5, 1.2, '#123');
-      T.rect(Math.round(cx - 4), y0, 4, 1, '#469');
+      T.rect(Math.round(cx - 5), y0, 4, 1, '#469');
     }, { light: [-0.7, -0.5, 0.5] });
 
-    // ---- tongs leaning on the hearth ----
+    // ---- tongs and a poker leaning on the forge ----
     layer(S, T => {
-      T.capsule(L.hx0 + 6, L.hTop + 1, L.hx0 + 10, L.yF + 2, 0.7, 0.7, R_STEEL, { hi: 6 });
-      T.capsule(L.hx0 + 8, L.hTop + 1, L.hx0 + 9, L.yF + 2, 0.7, 0.7, R_STEEL, { hi: 5 });
+      T.capsule(L.fx0 + 5, m.ledge + 4, L.fx0 + 9, L.yF + 2, 0.7, 0.7, R_STEEL, { hi: 7 });
+      T.capsule(L.fx0 + 7, m.ledge + 3, L.fx0 + 8, L.yF + 2, 0.7, 0.7, R_STEEL, { hi: 5 });
+      T.capsule(L.fx1 - 6, m.ledge + 2, L.fx1 - 2, L.yF + 2, 0.7, 0.7, R_STEEL, { hi: 6 });
     });
 
-    // ---- warm glow spilling out of the forge mouth over everything ----
-    for (let y = L.hoodBot - 6; y < L.yF + 6; y++) for (let x = 0; x < L.hx1 + 30; x++) {
-      const a = falloff(x, y, fx, fy + 2, 34, 1.3);
-      if (a * 0.55 > TH(x, y) + 0.12 && S.opaque(x, y)) {
-        const hx = S.getHex(x, y);
-        S.set(x, y, P.mix(hx, '#f92', 0.22));
-      }
+    // ---- hot air: glow spilling from the mouth over the forge front ----
+    for (let y = m.top - 8; y < L.yF + 4; y++) for (let x = 0; x < L.fx1 + 26; x++) {
+      if (inMouth(L, x, y)) continue;
+      const a = falloff(x, y, fx, fy, 40, 1.25);
+      if (a * 0.5 > TH(x, y) + 0.1) S.set(x, y, P.mix(S.getHex(x, y), '#f92', 0.2));
     }
   }
 
-  function smithyAnim(ctx, ox, oy, w, h, t) {
-    const L = smithLayout(w, h);
-    const f = Math.floor(t * 12) % NF;
-    // forge flames — cached per frame
-    const fw = L.hx1 - L.hx0 - 10, fh = L.hTop - L.hoodBot - 1;
-    const img = K.cached(`dw27|smfire|${fw}|${fh}|${f}`, fw, fh, S => {
-      const tongues = [];
-      const n = 6;
-      for (let i = 0; i < n; i++) {
-        const k = (i + 0.5) / n;
-        tongues.push({ cx: k * fw, base: fh + 1, h: fh * (0.55 + 0.4 * Math.sin(k * Math.PI)) * (0.85 + 0.15 * ((i * 7) % 3)), hw: fw / n * 0.95, sway: 1.6, ph: i * 1.9 });
-      }
-      paintFire(S, tongues, f, { lo: 2, gain: 1.05 });
+  // Forge flames: irregular tongues clipped to the arched mouth, cached per frame.
+  function smithFire(L, f) {
+    const m = L.m, fw = m.rx * 2, fh = m.ledge - m.top;
+    return K.cached(`dw27|smfire|${fw}|${fh}|${f}`, fw, fh, S => {
+      const base = fh - 3;
+      paintFire(S, [
+        { cx: fw * 0.5, base, h: fh * 0.98, hw: 6.5, sway: 2, ph: 0 },
+        { cx: fw * 0.36, base, h: fh * 0.75, hw: 5, sway: 1.8, ph: 1.7 },
+        { cx: fw * 0.64, base, h: fh * 0.82, hw: 5, sway: 1.6, ph: 3.4 },
+        { cx: fw * 0.22, base, h: fh * 0.45, hw: 3.5, sway: 1.2, ph: 4.9 },
+        { cx: fw * 0.8, base, h: fh * 0.5, hw: 3.5, sway: 1.3, ph: 2.6 },
+        { cx: fw * 0.44, base: base - fh * 0.55, h: fh * 0.3, hw: 2, sway: 2.5, ph: 5.5 },
+      ], f, { lo: 2 });
+      // keep it inside the arch
+      for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) if (!inMouth(L, x + m.cx - m.rx, y + m.top)) S.set(x, y, 0);
     });
-    G.blit(img, ox + L.hx0 + 5, oy + L.hoodBot + 1, { ctx });
-    // pulsing glow of the hot blade on the anvil
+  }
+
+  function smithyAnim(ctx, ox, oy, w, h, t) {
+    const L = smithLayout(w, h), m = L.m;
+    const f = Math.floor(t * 12) % NF;
+    G.blit(smithFire(L, f), ox + m.cx - m.rx, oy + m.top, { ctx });
+    // the coals breathe
+    const br = U.noise1(t * 3, 5);
+    G.blit(haloSprite(9, 0.15 + br * 0.3, '#fa2'), ox + m.cx - 9 - 8, oy + m.ledge - 12, { ctx });
+    G.blit(haloSprite(9, 0.15 + (1 - br) * 0.3, '#fa2'), ox + m.cx - 9 + 9, oy + m.ledge - 12, { ctx });
+    // the blade on the anvil cools and glows
     const pulse = 0.5 + 0.5 * Math.sin(t * 2.2);
     const ax = L.anv.x, ay = L.anv.y;
-    G.rect(ox + ax - 5, oy + ay - 4, 8, 1, pulse > 0.6 ? '#ffb' : '#fd5', ctx);
-    G.blit(haloSprite(6, 0.25 + pulse * 0.2, '#e70'), ox + ax - 7, oy + ay - 10, { ctx });
-    // sparks from the coals, popping up and arcing out
+    G.rect(ox + ax - 7, oy + ay - 5, 10, 1, pulse > 0.6 ? '#ffb' : '#fd5', ctx);
+    G.blit(haloSprite(7, 0.2 + pulse * 0.2, '#e70'), ox + ax - 8, oy + ay - 12, { ctx });
+    // sparks leaping from the coals
     const sp = remember(`smSp|${w}x${h}`, () => {
       const r = U.rng(5), out = [];
-      for (let i = 0; i < 16; i++) out.push({ x: L.hx0 + 8 + r() * (L.hx1 - L.hx0 - 16), y: L.hTop - 3, rise: 18 + r() * 26, rate: 0.5 + r() * 0.9, ph: r(), wob: 3 + r() * 4, amp: 0.8 + r() * 1.5, dx: (r() - 0.5) * 16 });
+      for (let i = 0; i < 18; i++) out.push({ x: m.cx - m.rx + 6 + r() * (m.rx * 2 - 12), y: m.ledge - 3, rise: 14 + r() * 30, rate: 0.5 + r() * 0.9, ph: r(), wob: 3 + r() * 4, amp: 0.8 + r() * 1.5, dx: (r() - 0.5) * 22 });
       return out;
     });
     drawEmbers(ctx, sp, t, ox, oy);
     // steam curling off the quench barrel
     const b = L.bar;
-    for (let i = 0; i < 5; i++) {
-      const life = (t * 0.35 + i / 5) % 1;
-      const x = (b.x0 + b.x1) / 2 + Math.sin(t * 1.3 + i * 2) * 2 + life * 3;
-      const y = b.y0 - 1 - life * 16;
+    for (let i = 0; i < 6; i++) {
+      const life = (t * 0.35 + i / 6) % 1;
+      const x = (b.x0 + b.x1) / 2 + Math.sin(t * 1.3 + i * 2) * 2 + life * 4 - 2;
+      const y = b.y0 - 1 - life * 18;
       if (life < 0.85) G.rect(ox + (x | 0), oy + (y | 0), life < 0.4 ? 2 : 1, 1, life < 0.5 ? '#556' : '#334', ctx);
     }
   }
 
   A.scenes['smithy'] = { paint: paintSmithy, animate: smithyAnim };
+
+  // ================================================================
+  // APOTHECARY — shelves of glowing bottles, a bubbling cauldron,
+  // drying herbs, a candle-crowned skull, mystical purples
+  // ================================================================
+  const AP_WALL = [
+    ['#000', '#101', '#102', '#203', '#213', '#314', '#324', '#425', '#435', '#536'],   // violet gloom
+    ['#100', '#101', '#201', '#212', '#312', '#322', '#423', '#533', '#634', '#745'],   // violet → amber
+    ['#100', '#200', '#210', '#311', '#421', '#532', '#642', '#753', '#864', '#a75'],   // candle amber
+    ['#001', '#011', '#012', '#112', '#122', '#223', '#233', '#334', '#344', '#455'],   // violet → green
+    ['#000', '#010', '#021', '#121', '#132', '#242', '#253', '#363', '#474', '#6a6'],   // cauldron green
+  ];
+  const LIQ = {
+    g: ['#010', '#031', '#062', '#0a4', '#3d6', '#9f9'],
+    r: ['#100', '#301', '#601', '#a12', '#e33', '#f88'],
+    b: ['#001', '#012', '#035', '#16a', '#3ae', '#9ef'],
+    a: ['#100', '#210', '#520', '#a50', '#e90', '#fd6'],
+    p: ['#101', '#102', '#305', '#629', '#a4d', '#d9f'],
+  };
+  const GLASS = ['#101', '#112', '#223', '#334', '#556', '#889'];
+
+  // Bottle shapes: half-width profile from the base up, neck rows, cork half-width.
+  const BOTTLES = {
+    flask: { body: [3, 4.5, 5.5, 6, 6, 5.5, 4.5, 3, 1.8], neck: [1.2, 1.2, 1.2, 1.5], cork: 1.5 },
+    vial: { body: [2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 1.6], neck: [1.2, 1.2], cork: 1.5 },
+    square: { body: [3.5, 3.5, 3.5, 3.5, 3.5, 3.5, 3.5, 3.5, 2.5, 1.5], neck: [1.2, 1.2], cork: 1.7 },
+    jar: { body: [4, 5, 5, 5, 5, 5, 5, 5, 4.5], neck: [4], cork: 5.5 },
+    gourd: { body: [3, 4, 4.4, 4, 2.6, 1.6, 2.8, 3.2, 2.6, 1.4], neck: [1, 1, 1], cork: 1.4 },
+    tall: { body: [2.6, 3, 3.2, 3.2, 3.2, 3.2, 3.2, 3.2, 3, 2.5, 1.8, 1.1], neck: [1, 1, 1, 1], cork: 1.4 },
+    phial: { body: [2.5, 3.2, 3.4, 3, 2, 1.2], neck: [0.8, 0.8], cork: 1.2 },
+  };
+  // Paint one bottle standing on (x, base).
+  function paintBottle(S, x, base, kind, liq, fill) {
+    const B = BOTTLES[kind], L2 = LIQ[liq];
+    const rows = B.body.length;
+    const lvl = Math.round(rows * fill);
+    for (let j = 0; j < rows; j++) {
+      const hw = B.body[j], y = base - 1 - j;
+      for (let i = Math.floor(-hw); i < Math.ceil(hw); i++) {
+        const u0 = (i + 0.5) / hw;
+        const xx = Math.round(x + i);
+        let col;
+        if (j < lvl) {
+          const v = 3.6 - Math.abs(u0) * 1.8 - (j / rows) * 0.9 + (u0 < 0 ? 0.25 : 0);
+          col = L2[clamp(Math.round(v + (TH(xx, y) - 0.5)), 1, 5)];
+          if (j === lvl - 1 && Math.abs(u0) < 0.7) col = L2[4];
+        } else col = Math.abs(u0) > 0.55 ? GLASS[2] : GLASS[1];
+        if (Math.abs(u0) > 0.82) col = j < lvl ? L2[1] : GLASS[2];
+        S.set(xx, y, col);
+      }
+    }
+    for (let j = 0; j < B.neck.length; j++) {
+      const hw = B.neck[j], y = base - 1 - rows - j;
+      for (let i = Math.floor(-hw); i < Math.ceil(hw); i++) S.set(Math.round(x + i), y, i < 0 ? GLASS[4] : GLASS[2]);
+    }
+    const cy = base - 1 - rows - B.neck.length;
+    for (let i = Math.floor(-B.cork); i < Math.ceil(B.cork); i++) { S.set(Math.round(x + i), cy, i < 0 ? '#975' : '#642'); S.set(Math.round(x + i), cy - 1, i < 0 ? '#753' : '#531'); }
+    // glass highlights (upper left) — a streak and a spark
+    const hj = Math.max(1, Math.floor(rows * 0.62));
+    const hx = Math.round(x - B.body[hj] + 1.2);
+    S.set(hx, base - 1 - hj, '#eef'); S.set(hx, base - hj, '#99b');
+    if (rows > 6) S.set(hx, base - 2 - hj, '#99b');
+    return rows + B.neck.length + 2;
+  }
+
+  function apoLayout(w, h) {
+    return remember(`ap|${w}x${h}`, () => {
+      const L = { w, h };
+      L.yF = h - 20;
+      L.cau = { x: 33, y: L.yF - 27, rx: 26 };                    // rim centre
+      L.sx0 = 72; L.sx1 = w - 5;
+      L.shelves = [L.yF - 44, L.yF - 20];
+      L.skull = { x: L.sx1 - 14, y: L.shelves[0] };
+      L.ball = { x: L.sx1 - 13, y: L.shelves[1] };
+      L.candles = [{ x: L.skull.x + 1, y: L.shelves[0] - 17 }, { x: L.sx0 + 5, y: L.shelves[1] - 10 }];
+      const rnd = U.rng(313);
+      const kinds = ['flask', 'vial', 'square', 'gourd', 'tall', 'phial', 'flask', 'phial'];
+      const liqs = ['g', 'r', 'b', 'g', 'r', 'b', 'a', 'p', 'g'];
+      L.bottles = [];
+      L.shelves.forEach((sy, si) => {
+        let x = L.sx0 + (si === 1 ? 11 : 3);
+        const stop = si === 0 ? L.skull.x - 8 : L.ball.x - 8;
+        let n = 0;
+        while (x < stop) {
+          if (si === 0 && n === 0) { L.bottles.push({ kind: 'books', x, y: sy }); x += 16; n++; continue; }
+          if (si === 0 && n === 2) { L.bottles.push({ kind: 'jar', x: x + 5, y: sy, liq: 'g', fill: 0.9, eye: true, ph: 1 }); x += 12; n++; continue; }
+          if (si === 1 && n === 3 && x + 12 < stop) { L.bottles.push({ kind: 'mortar', x: x + 5, y: sy }); x += 13; n++; continue; }
+          const kind = kinds[Math.floor(rnd() * kinds.length)];
+          const hw = Math.ceil(Math.max(...BOTTLES[kind].body, BOTTLES[kind].cork));
+          if (x + hw * 2 > stop) break;
+          L.bottles.push({ kind, x: x + hw, y: sy, liq: liqs[Math.floor(rnd() * liqs.length)], fill: 0.4 + rnd() * 0.5, ph: rnd() * 10 });
+          x += hw * 2 + (rnd() < 0.3 ? 4 : 1);
+          n++;
+        }
+      });
+      // things hanging from the beam (away from the back button)
+      L.herbs = [];
+      let hx = 50, i = 0;
+      while (hx < w - 8) {
+        L.herbs.push({ x: hx, kind: [0, 1, 4, 2, 0, 3, 1, 2, 0, 4][i % 10], len: clamp(L.shelves[0] - 24, 5, 7 + Math.floor(rnd() * 5)) });
+        hx += 17 + Math.floor(rnd() * 9); i++;
+      }
+      return L;
+    });
+  }
+
+  function paintApothecary(S, w, h) {
+    const L = apoLayout(w, h);
+    const C = L.cau;
+    const lights = [];
+    for (const c of L.candles) lights.push({ x: c.x, y: c.y + 2, r: 44, i: 0.9, k: 1 });
+    lights.push({ x: C.x + 2, y: C.y - 2, r: 86, i: 1.2, k: 2 });
+    const lightAt = (x, y) => {
+      let warm = 0, green = 0;
+      for (const l of lights) {
+        const a = falloff(x, y, l.x, l.y, l.r) * l.i;
+        if (l.k === 1) warm += a; else green += a;
+      }
+      return [warm, green];
+    };
+    const pickAp = (b, warm, green, x, y) => {
+      const tint = green > warm ? green : warm;
+      const v = clamp(tint * 2.4, 0, 2);
+      let ti = Math.floor(v); if (v - ti > TH(x + 2, y + 3)) ti++;
+      const row = ti === 0 ? 0 : green > warm ? 2 + ti : ti;
+      const g = AP_WALL[Math.min(4, row)], bv = clamp(b, 0, 1) * (g.length - 1);
+      let i = Math.floor(bv); if (bv - i > TH(x, y)) i++;
+      return g[Math.min(g.length - 1, i)];
+    };
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const [warm, green] = lightAt(x, y);
+      const amb = 0.72 + 1.1 * (warm + green);
+      if (y < 5) {                                             // ceiling beam
+        let b = y === 4 ? 0.1 : y === 3 ? 0.38 : 0.26;
+        b += (vnoise(x * 0.15, y, 4) - 0.5) * 0.12;
+        S.set(x, y, pickAp(b * amb, warm, green, x, y));
+        continue;
+      }
+      if (y >= L.yF) {                                         // floorboards
+        const yy = y - L.yF, plank = Math.floor(yy / 4);
+        let b = (yy % 4 === 3) ? 0.1 : 0.3 + hash2(plank, Math.floor((x + plank * 13) / 31), 3) * 0.08;
+        if (((x + plank * 13) % 31) === 0) b = 0.1;
+        S.set(x, y, pickAp(b * (0.4 + amb * 0.5), warm, green, x, y));
+        continue;
+      }
+      // dark timber panelling: vertical boards with grain, a rail along the wainscot
+      const bx = Math.floor((x + 4) / 9), lx = (x + 4) - bx * 9;
+      let b = 0.27 + hash2(bx, 0, 41) * 0.07;
+      b += (vnoise(x * 0.9, y * 0.06 + bx * 3, 19) - 0.5) * 0.12;
+      if (lx === 0) b = 0.08; else if (lx === 1) b += 0.06; else if (lx === 8) b -= 0.06;
+      if (hash2(bx, Math.floor(y / 3), 42) > 0.985) b = 0.1;                // knot
+      if (y === L.yF - 12) b = 0.42; else if (y === L.yF - 11) b = 0.26; else if (y === L.yF - 10) b = 0.08;
+      S.set(x, y, pickAp(b * amb, warm, green, x, y));
+    }
+
+    // ---- shelves on iron brackets ----
+    layer(S, T => {
+      for (const sy of L.shelves) {
+        T.rect(L.sx0, sy, L.sx1 - L.sx0, 1, '#753');
+        T.rect(L.sx0, sy + 1, L.sx1 - L.sx0, 2, '#421');
+        T.rect(L.sx0, sy + 3, L.sx1 - L.sx0, 1, '#210');
+        for (const bx of [L.sx0 + 6, L.sx1 - 8]) { T.line(bx, sy + 4, bx + 3, sy + 4, '#223'); T.line(bx, sy + 4, bx, sy + 7, '#223'); T.line(bx, sy + 7, bx + 3, sy + 4, '#112'); }
+      }
+    });
+
+    // ---- bottles, books, the specimen jar, the mortar ----
+    const B = K.create(w, h);
+    for (const b of L.bottles) {
+      if (b.kind === 'books') {
+        const cols = [['#412', '#734'], ['#132', '#364'], ['#213', '#436'], ['#320', '#653']];
+        let x = b.x;
+        for (let i = 0; i < 4; i++) {
+          const [d, l] = cols[i % 4], bh = 11 + ((i * 5 + 1) % 4), bw = 2 + (i & 1);
+          B.rect(x, b.y - bh, bw, bh, d); B.rect(x, b.y - bh, 1, bh, l);
+          B.rect(x, b.y - bh + 2, bw, 1, '#a83'); B.rect(x, b.y - 3, bw, 1, '#a83');
+          x += bw;
+        }
+        B.poly([[x, b.y], [x + 2, b.y], [x + 7, b.y - 11], [x + 5, b.y - 12]], ['#100', '#301', '#412', '#623'], { tone: 0.5 });   // a leaning tome
+      } else if (b.kind === 'mortar') {
+        B.ball(b.x, b.y - 3, 4.5, 3.2, ['#101', '#212', '#323', '#434', '#656', '#878']);
+        B.rect(b.x - 4, b.y - 6, 9, 1, '#545');
+        B.capsule(b.x + 1, b.y - 6, b.x + 5, b.y - 11, 1, 0.9, ['#101', '#323', '#545', '#767']);
+      } else {
+        paintBottle(B, b.x, b.y, b.kind, b.liq, b.fill);
+        if (b.eye) {                                     // something pickled, staring back
+          B.ball(b.x, b.y - 5, 2.6, 2.6, ['#433', '#655', '#988', '#cba', '#edc']);
+          B.px(b.x - 1, b.y - 5, '#a12'); B.px(b.x, b.y - 5, '#100'); B.px(b.x, b.y - 6, '#a12');
+        }
+      }
+    }
+    B.outline('#101');
+    // glow halos behind the bottles
+    for (const b of L.bottles) {
+      if (!b.liq) continue;
+      const g = LIQ[b.liq];
+      for (let y = b.y - 20; y < b.y; y++) for (let x = b.x - 10; x <= b.x + 10; x++) {
+        if (B.opaque(x, y) || !S.opaque(x, y)) continue;
+        const a = falloff(x, y, b.x, b.y - 5, 11);
+        if (a > TH(x, y) + 0.12) S.set(x, y, a > 0.45 ? g[2] : g[1]);
+      }
+    }
+    S.stamp(B, 0, 0);
+
+    // ---- the skull crowned with a guttering candle ----
+    layer(S, T => {
+      const { x, y } = L.skull;
+      const BONE = ['#100', '#211', '#432', '#654', '#876', '#a98', '#cba', '#edc'];
+      T.ball(x, y - 7, 6.5, 6, BONE, { spec: 0.2 });
+      T.ball(x + 0.5, y - 2.5, 4, 2.5, BONE, { hi: 5 });
+      T.rect(x - 5, y - 8, 4, 3, '#100'); T.rect(x + 1, y - 8, 4, 3, '#100');
+      T.px(x - 4, y - 7, '#601'); T.px(x + 2, y - 7, '#601');
+      T.px(x, y - 4, '#211'); T.px(x - 1, y - 4, '#321');
+      for (let i = -3; i <= 3; i += 2) T.px(x + i, y - 1, '#321');
+      T.rect(x - 1, y - 17, 4, 6, '#dcb'); T.rect(x - 1, y - 17, 1, 6, '#fed'); T.rect(x + 2, y - 17, 1, 6, '#a98');
+      T.rect(x - 3, y - 12, 8, 1, '#dcb'); T.px(x - 3, y - 11, '#cba'); T.px(x + 4, y - 11, '#cba'); T.px(x - 4, y - 10, '#a98'); T.px(x + 4, y - 9, '#a98');
+      T.px(x + 1, y - 18, '#211');
+    }, { light: [-0.5, -0.8, 0.4] });
+
+    // ---- crystal ball on a claw stand ----
+    layer(S, T => {
+      const { x, y } = L.ball;
+      T.poly([[x - 5, y], [x + 5, y], [x + 3, y - 3], [x - 3, y - 3]], R_BRASS, { tone: 0.45 });
+      T.ball(x, y - 9, 6.5, 6.5, ['#102', '#204', '#316', '#428', '#63a', '#94d', '#c7f', '#ebf'], { spec: 1.2, depth: 0.8 });
+      T.px(x - 3, y - 13, '#fff'); T.px(x - 4, y - 12, '#dbf'); T.px(x - 2, y - 13, '#dbf');
+      T.horn(x - 4, y - 3, x - 6, y - 6, x - 5, y - 8, 0.9, 0.5, R_BRASS, { hi: 6 });
+      T.horn(x + 4, y - 3, x + 6, y - 6, x + 5, y - 8, 0.9, 0.5, R_BRASS, { hi: 5 });
+    });
+    for (let y = L.ball.y - 24; y < L.ball.y; y++) for (let x = L.ball.x - 14; x <= L.ball.x + 14; x++) {
+      const a = falloff(x, y, L.ball.x, L.ball.y - 9, 15);
+      const hx = S.getHex(x, y);
+      if (hx && a > TH(x, y) + 0.08 && Math.hypot(x + 0.5 - L.ball.x, y + 0.5 - (L.ball.y - 9)) > 7.2) S.set(x, y, a > 0.4 ? '#527' : '#314');
+    }
+    // the lower candle
+    layer(S, T => {
+      const c = L.candles[1];
+      T.rect(c.x - 1, c.y + 1, 3, 9, '#dcb'); T.rect(c.x - 1, c.y + 1, 1, 9, '#fed'); T.rect(c.x + 1, c.y + 1, 1, 9, '#a98');
+      T.rect(c.x - 2, c.y + 9, 5, 1, '#876'); T.px(c.x - 2, c.y + 4, '#cba');
+      T.px(c.x, c.y, '#211');
+    });
+
+    // ---- herbs, lavender, garlic and a dried bat hang from the beam ----
+    layer(S, T => {
+      for (const hb of L.herbs) {
+        const x = hb.x, y0 = 4;
+        if (hb.kind === 4) {                                       // dried bat, hung by its feet
+          T.line(x, y0, x, y0 + 2, '#432');
+          T.poly([[x - 2.5, y0 + 3], [x + 2.5, y0 + 3], [x + 3.5, y0 + 9], [x, y0 + 11], [x - 3.5, y0 + 9]], ['#101', '#202', '#313', '#424', '#535'], { grad: [x - 3, y0 + 3, x + 3, y0 + 11, 0.85, 0.2] });
+          T.px(x - 1, y0 + 10, '#d33'); T.px(x + 1, y0 + 10, '#d33');
+          T.px(x - 1, y0 + 12, '#101'); T.px(x + 1, y0 + 12, '#101');
+          continue;
+        }
+        T.line(x, y0, x, y0 + 3, '#432');
+        if (hb.kind === 3) {                                       // garlic braid
+          for (let i = 0; i < 3; i++) T.ball(x + (i & 1 ? 1 : -1), y0 + 6 + i * 3.4, 2.3, 2, ['#211', '#543', '#876', '#ba9', '#dcb']);
+          continue;
+        }
+        const leaf = hb.kind === 0 ? ['#010', '#121', '#232', '#353', '#474'] : hb.kind === 1 ? ['#110', '#221', '#342', '#463', '#584'] : ['#101', '#213', '#324', '#436', '#547'];
+        T.rect(x - 1, y0 + 3, 3, 1, '#875');
+        const n = 7 + (hb.len & 3);
+        for (let i = 0; i < n; i++) {
+          const a = -0.55 + i * (1.1 / (n - 1)), len = hb.len * (0.7 + ((i * 7) % 4) * 0.1);
+          T.capsule(x, y0 + 4, x + Math.sin(a) * len * 0.5, y0 + 4 + Math.cos(a) * len, 0.6, 0.9, leaf, { hi: 4 });
+        }
+        if (hb.kind === 2) for (let i = 0; i < 7; i++) T.px(x - 3 + i, y0 + 3 + hb.len - ((i * 3) % 3), i & 1 ? '#a7d' : '#859');
+      }
+    }, { light: [-0.6, -0.7, 0.4] });
+
+    // ---- the cauldron on its fire-stones ----
+    layer(S, T => {
+      const { x, y, rx } = C;
+      const IRON = ['#000', '#101', '#111', '#112', '#212', '#223', '#334', '#445'];
+      for (const [sx, sr] of [[x - 17, 5], [x + 17, 5], [x - 3, 4], [x + 6, 3.5]]) T.ball(sx, L.yF - 1, sr, 3.2, ['#101', '#112', '#212', '#323', '#434', '#545']);
+      for (const sd of [-1, 1]) T.capsule(x + sd * 13, y + 22, x + sd * 16, L.yF - 1, 1.6, 1.1, IRON, { hi: 5 });
+      T.ball(x, y + 11, rx, 15, IRON, { spec: 0.35 });
+      T.capsule(x - rx + 1, y + 1, x + rx - 1, y + 1, 2.4, 2.4, IRON, { hi: 6 });
+      for (const sd of [-1, 1]) { T.ball(x + sd * (rx + 1), y + 6, 2.4, 2.6, IRON, { hi: 6 }); T.px(x + sd * (rx + 1), y + 6, '#000'); }
+      // green light from the brew washing the lip and upper belly
+      T.recolor((px, py) => py > y - 3 && py < y + 6 && Math.abs(px + 0.5 - x) < rx + 4, (hx, px, py) => (py < y + 2 ? (TH(px, py) < 0.65 ? '#364' : '#253') : (TH(px, py) < 0.4 ? '#132' : hx)));
+      T.recolor((px, py) => py === y - 1 && Math.abs(px + 0.5 - x) < rx - 2, () => '#6a6');
+      T.ellipse(x, y + 0.5, rx - 3, 2.4, '#062');
+      for (let i = -rx + 4; i < rx - 3; i++) if (hash2(i, 0, 7) > 0.55) T.px(x + i, y + (i & 1), '#0a4');
+      T.rect(x - 8, y, 12, 1, '#3d6'); T.rect(x - 4, y, 4, 1, '#9f9');
+      // a ladle hooked over the rim
+      T.capsule(x + 10, y - 1, x + 20, y - 13, 0.9, 0.9, R_WOOD, { hi: 6 });
+    }, { light: [-0.6, -0.7, 0.4] });
+  }
+
+  // Fume puff: a soft two-tone blob (solid core, dithered rim), cached by size and shade.
+  const FUME = [['#253', '#364', '#6a6'], ['#142', '#253', '#364'], ['#132', '#142', '#253'], ['#121', '#132', '#142']];
+  const wisp = (r, lv) => K.cached(`dw27|puff|${r}|${lv}`, r * 2 + 2, r * 2 + 2, S => {
+    const c = FUME[lv];
+    for (let y = 0; y < r * 2 + 2; y++) for (let x = 0; x < r * 2 + 2; x++) {
+      const dx = x + 0.5 - r - 1, dy = (y + 0.5 - r - 1) * 1.25;
+      const d = Math.hypot(dx, dy) / (r + 0.5);
+      if (d >= 1) continue;
+      if (d < 0.45) S.set(x, y, dx + dy < -r * 0.3 ? c[2] : c[1]);
+      else if (d < 0.75 || (1 - d) * 3.2 > TH(x, y)) S.set(x, y, c[0]);
+    }
+  });
+
+  function apothecaryAnim(ctx, ox, oy, w, h, t) {
+    const L = apoLayout(w, h), C = L.cau;
+    // fire under the cauldron
+    const f = Math.floor(t * 12) % NF;
+    const fire = K.cached(`dw27|apfire|${f}`, 26, 8, S => {
+      paintFire(S, [
+        { cx: 8, base: 8, h: 7, hw: 3, sway: 1, ph: 0 }, { cx: 13, base: 8, h: 8, hw: 3.2, sway: 1.2, ph: 2 },
+        { cx: 18, base: 8, h: 6.5, hw: 3, sway: 1, ph: 4 },
+      ], f, { lo: 2 });
+    });
+    G.blit(fire, ox + C.x - 13, oy + L.yF - 7, { ctx });
+    // bubbles rising through the brew and popping
+    for (let i = 0; i < 7; i++) {
+      const ph = (t * (0.8 + (i % 3) * 0.3) + i * 0.37) % 1;
+      const bx = C.x - C.rx + 5 + ((i * 11) % (C.rx * 2 - 9));
+      if (ph < 0.6) { G.rect(ox + bx, oy + C.y, 2, 1, '#6e8', ctx); G.rect(ox + bx, oy + C.y - 1, 2, 1, ph < 0.3 ? '#3d6' : '#9f9', ctx); }
+      else if (ph < 0.75) { G.rect(ox + bx - 1, oy + C.y - 1, 1, 1, '#9f9', ctx); G.rect(ox + bx + 2, oy + C.y - 1, 1, 1, '#9f9', ctx); }
+    }
+    // fumes curling up and fading
+    for (let i = 0; i < 7; i++) {
+      const life = (t * 0.14 + i / 7) % 1;
+      const x = C.x + Math.sin(t * 0.8 + i * 2.1 + life * 5) * (2 + life * 7) + (i - 3) * 2.5;
+      const y = C.y - 2 - life * (C.y + 4);
+      const r = Math.round(1.5 + life * 4), lv = Math.min(3, Math.floor(life * 4.4));
+      G.blit(wisp(r, lv), ox + Math.round(x) - r - 1, oy + Math.round(y) - r - 1, { ctx });
+    }
+    // candle flames
+    L.candles.forEach((c, i) => G.blit(candleFlame((Math.floor(t * 9) + i * 2) % 4), ox + c.x - 2, oy + c.y - 5, { ctx }));
+    // a few bottles twinkle with rising specks
+    for (const b of L.bottles) {
+      if (!b.liq || b.kind === 'jar') continue;
+      const ph = (t * 0.7 + b.ph) % 3;
+      if (ph < 1) {
+        const yy = b.y - 2 - Math.floor(ph * 4);
+        G.rect(ox + b.x, oy + yy, 1, 1, LIQ[b.liq][5], ctx);
+      }
+    }
+  }
+
+  A.scenes['apothecary'] = { paint: paintApothecary, animate: apothecaryAnim };
+
+  // ================================================================
+  // INN — The Rusty Flagon's common room: firelight, beams, ale,
+  // and a hooded stranger nursing a pipe in the dark corner
+  // ================================================================
+  const IN_WALL = [
+    ['#000', '#101', '#101', '#111', '#212', '#212', '#322', '#323', '#433', '#434'],
+    ['#000', '#100', '#201', '#211', '#311', '#321', '#422', '#432', '#533', '#643'],
+    ['#100', '#200', '#210', '#320', '#431', '#531', '#642', '#752', '#863', '#974'],
+    ['#100', '#310', '#420', '#531', '#641', '#752', '#863', '#a74', '#c95', '#eb7'],
+  ];
+  const R_PEWTER = ['#101', '#212', '#323', '#434', '#545', '#766', '#987', '#bba'];
+  const R_RUST = ['#100', '#200', '#310', '#420', '#531', '#742', '#953', '#b74'];
+
+  function innLayout(w, h) {
+    return remember(`in|${w}x${h}`, () => {
+      const L = { w, h };
+      L.yF = h - 20;
+      L.fp = { x0: 3, x1: 63, top: L.yF - 50, ox0: 13, ox1: 53, oTop: L.yF - 30 };   // fireplace + opening
+      L.fire = { x: (L.fp.ox0 + L.fp.ox1) / 2, y: L.yF - 8 };
+      L.kegs = { x0: 70, y: L.yF - 14 };
+      L.table = { x0: Math.round(w * 0.5) - 6, x1: Math.round(w * 0.5) + 34, y: L.yF - 15 };
+      L.fig = { x: w - 25, y: L.yF - 50 };                              // hood tip
+      L.ctab = { x0: w - 46, x1: w - 3, y: L.yF - 16 };
+      L.sign = { x: Math.round(w * 0.5) + 14, y: 9 };
+      L.candles = [{ x: L.table.x0 + 22, y: L.table.y - 9 }, { x: L.fp.x0 + 8, y: L.fp.top - 9 }, { x: L.fp.x1 - 9, y: L.fp.top - 7 }];
+      L.pipe = { x: L.fig.x - 12, y: L.fig.y + 21 };
+      return L;
+    });
+  }
+
+  function paintInn(S, w, h) {
+    const L = innLayout(w, h), F2 = L.fp;
+    const lights = [
+      { x: L.fire.x, y: L.fire.y - 4, r: w * 1.05, i: 1.15 },
+      { x: L.candles[0].x, y: L.candles[0].y, r: 34, i: 0.6 },
+      { x: L.candles[1].x, y: L.candles[1].y, r: 26, i: 0.35 },
+      { x: L.candles[2].x, y: L.candles[2].y, r: 26, i: 0.35 },
+    ];
+    const lightAt = (x, y) => {
+      let v = 0;
+      for (const l of lights) v += falloff(x, y, l.x, l.y, l.r) * l.i;
+      // the corner keeps its secrets
+      const dc = Math.hypot(x + 0.5 - L.fig.x, (y + 0.5 - (L.fig.y + 20)) * 0.8);
+      return v * (0.3 + 0.7 * smooth(16, 48, dc));
+    };
+    const timberX = [];
+    for (let x = 66; x < w; x += 38) timberX.push(x);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const lf = lightAt(x, y);
+      // ---- ceiling beam with a lit lower edge ----
+      if (y < 7) {
+        let b = y === 6 ? 0.1 : y === 5 ? 0.45 : 0.3 + (vnoise(x * 0.12, y * 0.5, 6) - 0.5) * 0.14;
+        S.set(x, y, rampPick(R_WOOD, b * (0.45 + lf * 1.2), x, y));
+        continue;
+      }
+      // ---- fireplace: rough stone surround, sooty opening, hearth ----
+      if (x >= F2.x0 && x < F2.x1 && y >= F2.top && y < L.yF) {
+        const inO = x >= F2.ox0 && x < F2.ox1 && y >= F2.oTop;
+        if (inO) {
+          const t = (y - F2.oTop) / (L.yF - F2.oTop);
+          const side = Math.abs(x + 0.5 - L.fire.x) / ((F2.ox1 - F2.ox0) / 2);
+          const b = (0.18 + t * 0.5) * (1 - side * 0.4) + (hash2(x, y, 3) - 0.5) * 0.05;
+          S.set(x, y, pick(IN_WALL, b, 0.7 + t * 0.3, x, y));
+          continue;
+        }
+        if (y < F2.top + 4) {                                   // mantel beam
+          const b = y === F2.top ? 0.5 : y === F2.top + 3 ? 0.12 : 0.34;
+          S.set(x, y, rampPick(R_WOOD, b * (0.5 + lf * 1.1), x, y));
+          continue;
+        }
+        let b = roughStone(x * 1.4, y, 6, 17) * 0.95;
+        if (y >= F2.oTop - 4 && y < F2.oTop && x >= F2.ox0 - 2 && x < F2.ox1 + 2) b = y === F2.oTop - 1 ? 0.6 : 0.4;   // lintel lit from below
+        if (x === F2.x0) b += 0.06; if (x === F2.x1 - 1) b -= 0.08;
+        S.set(x, y, pick(IN_WALL, b * (0.35 + lf * 1.0), 0.3 + lf * 0.9, x, y));
+        continue;
+      }
+      // ---- floorboards ----
+      if (y >= L.yF) {
+        const yy = y - L.yF, plank = Math.floor(yy / 4);
+        let b = (yy % 4 === 3) ? 0.1 : 0.32 + hash2(plank, Math.floor((x + plank * 17) / 29), 3) * 0.08;
+        if (((x + plank * 17) % 29) === 0) b = 0.12;
+        if (yy < 2) b *= 0.6;
+        S.set(x, y, pick(IN_WALL, b * (0.3 + lf * 1.1), lf * 1.0, x, y));
+        continue;
+      }
+      // ---- half-timbered wall: plaster panels in dark oak frames ----
+      const dado = L.yF - 13;
+      let timber = false, tb = 0.3;
+      if (y >= dado) { timber = true; tb = y === dado ? 0.5 : y === dado + 1 ? 0.15 : 0.26 + (((x + 2) % 11 === 0) ? -0.15 : 0); }
+      else if (y >= 22 && y < 26) { timber = true; tb = y === 22 ? 0.45 : y === 25 ? 0.12 : 0.3; }
+      else {
+        for (const tx of timberX) {
+          const d = x - tx;
+          if (d >= 0 && d < 4) { timber = true; tb = d === 0 ? 0.42 : d === 3 ? 0.14 : 0.28; break; }
+          // a diagonal brace in the upper panels
+          const bd = (x - tx - 4) - (y - 7) * 1.4;
+          if (y < 22 && x > tx + 3 && x < tx + 38 && bd >= 0 && bd < 3.2 && ((tx / 38) & 1)) { timber = true; tb = bd < 1 ? 0.4 : bd > 2.2 ? 0.14 : 0.27; break; }
+        }
+      }
+      if (timber) {
+        tb += (vnoise(x * 0.5, y * 0.2, 13) - 0.5) * 0.1;
+        S.set(x, y, rampPick(R_WOOD, tb * (0.5 + lf * 1.15), x, y));
+        continue;
+      }
+      // plaster: soft mottling, cracks, a few bare stones
+      let b = 0.42 + (fbm(x * 0.08, y * 0.1, 31, 3) - 0.5) * 0.18 + (hash2(x, y, 9) - 0.5) * 0.04;
+      if (vnoise(x * 0.06, y * 0.06, 77) > 0.74) b = roughStone(x, y, 4, 5) * 0.9;
+      S.set(x, y, pick(IN_WALL, b * (0.3 + lf * 0.95), lf * 0.95, x, y));
+    }
+
+    // ---- the fire's grate and logs ----
+    layer(S, T => {
+      const fx = L.fire.x, by = L.yF - 2;
+      T.capsule(fx - 13, by - 1, fx + 11, by - 3, 2.2, 2, R_WOOD, { hi: 5 });
+      T.capsule(fx - 9, by - 3, fx + 14, by - 1, 2.1, 2.1, R_WOOD, { hi: 4 });
+      T.ellipse(fx + 14, by - 1, 1.6, 2, '#a52'); T.ellipse(fx - 13, by - 1, 1.6, 2, '#842');
+      T.rect(fx - 16, by + 1, 33, 1, '#212');
+      for (const sd of [-15, 15]) T.capsule(fx + sd, by + 1, fx + sd, by - 6, 0.8, 0.8, R_STEEL, { hi: 4 });
+    });
+    // glowing embers on the hearth floor
+    for (let x = F2.ox0 + 2; x < F2.ox1 - 2; x++) {
+      const y = L.yF - 1;
+      if (hash2(x, 3, 5) > 0.5) S.set(x, y, FIRE[2 + Math.floor(hash2(x, 4, 5) * 3)]);
+    }
+
+    // ---- on the mantel: antlers, tankards, a candle ----
+    layer(S, T => {
+      const ax = L.kegs.x0 + (w >= 260 ? 22 : 15), ay = L.kegs.y - 36;
+      const ANT = ['#100', '#211', '#432', '#654', '#876', '#a98', '#cba'];
+      T.poly([[ax - 3, ay + 1], [ax + 3, ay + 1], [ax + 4, ay + 8], [ax - 4, ay + 8]], R_WOOD, { tone: 0.5 });   // plaque
+      for (const sd of [-1, 1]) {
+        T.horn(ax + sd * 2, ay + 2, ax + sd * 9, ay + 1, ax + sd * 13, ay - 8, 1.2, 0.6, ANT, { hi: 6 });
+        T.horn(ax + sd * 7, ay, ax + sd * 7, ay - 4, ax + sd * 5, ay - 7, 0.8, 0.4, ANT, { hi: 5 });
+        T.horn(ax + sd * 11, ay - 3, ax + sd * 14, ay - 4, ax + sd * 17, ay - 3, 0.7, 0.4, ANT, { hi: 5 });
+      }
+      for (const tx of [F2.x0 + 15, F2.x1 - 16]) {
+        T.capsule(tx, F2.top - 6, tx, F2.top - 1, 2.3, 2.3, R_PEWTER, { hi: 6 });
+        T.rect(tx - 2, F2.top - 7, 5, 1, '#987');
+        T.horn(tx + 2, F2.top - 5, tx + 5, F2.top - 4, tx + 2, F2.top - 2, 0.6, 0.6, R_PEWTER, { hi: 5 });
+      }
+      for (const c of [L.candles[1], L.candles[2]]) {
+        T.rect(c.x - 1, c.y + 1, 2, F2.top - c.y - 1, '#dcb'); T.rect(c.x - 1, c.y + 1, 1, F2.top - c.y - 1, '#fed');
+        T.px(c.x, c.y, '#211');
+      }
+    }, { light: [-0.5, 0.2, 0.6] });
+
+    // ---- kegs racked on the back wall with a shelf of tankards above ----
+    layer(S, T => {
+      const k = L.kegs;
+      const n = w >= 260 ? 3 : 2;
+      T.rect(k.x0 - 2, k.y + 9, n * 15 + 4, 2, '#321');
+      for (let i = 0; i < n; i++) {
+        const kx = k.x0 + 7 + i * 15, ky = k.y;
+        T.ball(kx, ky, 7, 7, R_WOOD, { depth: 0.4, hi: 6 });
+        T.recolor((px, py) => { const d = Math.hypot(px + 0.5 - kx, py + 0.5 - ky); return d > 5.6 && d < 7.2; }, (hx, px, py) => (px + py < kx + ky ? '#765' : '#323'));
+        T.ellipse(kx, ky, 2, 2, '#321');
+        T.rect(kx - 1, ky + 2, 2, 3, '#a83'); T.px(kx - 1, ky + 2, '#dc6');
+      }
+      // shelf + tankards
+      const sy = k.y - 13;
+      T.rect(k.x0 - 2, sy, n * 15 + 4, 2, '#642'); T.rect(k.x0 - 2, sy + 2, n * 15 + 4, 1, '#210');
+      for (let i = 0; i < n * 2; i++) {
+        const tx = k.x0 + 4 + i * 7.5;
+        T.capsule(tx, sy - 6, tx, sy - 1, 2.2, 2.2, i & 1 ? R_PEWTER : R_WOOD, { hi: 6 });
+        T.horn(tx + 2, sy - 5, tx + 4.5, sy - 4, tx + 2, sy - 2, 0.6, 0.6, i & 1 ? R_PEWTER : R_WOOD, { hi: 5 });
+      }
+    }, { light: [-0.8, -0.3, 0.5] });
+
+    // ---- the inn sign: a rusty iron flagon on a bracket ----
+    layer(S, T => {
+      const { x, y } = L.sign;
+      T.capsule(x - 12, y - 1, x + 3, y - 1, 0.8, 0.8, R_STEEL, { hi: 4 });
+      T.line(x - 1, y - 1, x - 1, y + 2, '#223');
+      T.ball(x - 1, y + 9, 6, 7, R_RUST, { depth: 0.6 });
+      T.rect(x - 7, y + 3, 12, 2, '#953'); T.rect(x - 7, y + 3, 4, 1, '#b74');
+      T.horn(x + 5, y + 5, x + 10, y + 7, x + 5, y + 12, 1.1, 1.1, R_RUST, { hi: 6 });
+      T.rect(x - 6, y + 2, 9, 1, '#531'); T.px(x - 7, y + 2, '#742');
+      for (const [dx, dy] of [[-3, 8], [1, 11], [-1, 14]]) T.px(x + dx, y + dy, '#a52');   // rust bloom
+      T.capsule(x - 5, y + 9, x - 5, y + 13, 0.5, 0.5, ['#310', '#742', '#b74']);
+    }, { light: [-0.8, 0.2, 0.55] });
+
+    // ---- centre table: tankards, a plate, a candle ----
+    layer(S, T => {
+      const tb = L.table;
+      T.rect(tb.x0, tb.y, tb.x1 - tb.x0, 2, '#853'); T.rect(tb.x0, tb.y, tb.x1 - tb.x0, 1, '#a75');
+      T.rect(tb.x0, tb.y + 2, tb.x1 - tb.x0, 3, '#421'); T.rect(tb.x0, tb.y + 5, tb.x1 - tb.x0, 1, '#210');
+      for (const lx of [tb.x0 + 2, tb.x1 - 4]) T.rect(lx, tb.y + 6, 2, L.yF + 4 - tb.y - 6, '#310');
+      const c = L.candles[0];
+      T.rect(c.x - 1, c.y + 1, 2, tb.y - c.y - 1, '#dcb'); T.rect(c.x - 1, c.y + 1, 1, tb.y - c.y - 1, '#fed'); T.px(c.x, c.y, '#211');
+      T.rect(c.x - 2, tb.y - 1, 4, 1, '#876');
+      for (const [tx, kind] of [[tb.x0 + 6, 0], [tb.x0 + 13, 1], [tb.x1 - 7, 0]]) {
+        T.capsule(tx, tb.y - 6, tx, tb.y - 1, 2.4, 2.4, kind ? R_PEWTER : R_WOOD, { hi: 6 });
+        T.horn(tx + 2, tb.y - 5, tx + 5, tb.y - 4, tx + 2, tb.y - 2, 0.6, 0.6, kind ? R_PEWTER : R_WOOD, { hi: 5 });
+        T.rect(tx - 2, tb.y - 7, 4, 1, '#ec8');                    // foam
+        T.px(tx - 1, tb.y - 8, '#ffd');
+      }
+      T.ellipse(tb.x1 - 15, tb.y - 1, 4, 1.2, '#654'); T.ball(tb.x1 - 15, tb.y - 2, 2.2, 1.4, ['#310', '#631', '#a63']);   // bread
+    }, { light: [-0.7, -0.4, 0.5] });
+
+    // ---- a notice board of bounties and rumours by the stranger's corner ----
+    layer(S, T => {
+      const bx0 = Math.max(L.table.x1 + 6, L.ctab.x0 - 34), bx1 = L.ctab.x0 - 4, by0 = L.yF - 52, by1 = L.yF - 32;
+      if (bx1 - bx0 < 14) return;
+      T.rect(bx0, by0, bx1 - bx0, by1 - by0, '#321'); T.rect(bx0, by0, bx1 - bx0, 1, '#542'); T.rect(bx0, by0, 1, by1 - by0, '#432');
+      T.rect(bx0 + 1, by1 - 1, bx1 - bx0 - 1, 1, '#100');
+      const notes = [[2, 2, 7, 8, '#a98', '#cb9'], [10, 3, 6, 6, '#987', '#ba9'], [bx1 - bx0 - 9, 2, 7, 9, '#ba9', '#dca'], [5, 11, 8, 6, '#987', '#ba8']];
+      for (const [nx, ny, nw, nh, c0, c1] of notes) {
+        if (nx + nw > bx1 - bx0 - 1 || ny + nh > by1 - by0 - 1) continue;
+        T.rect(bx0 + nx, by0 + ny, nw, nh, c0); T.rect(bx0 + nx, by0 + ny, nw - 1, 1, c1);
+        for (let r = 2; r < nh - 1; r += 2) T.rect(bx0 + nx + 1, by0 + ny + r, nw - 3 - (r & 2 ? 1 : 0), 1, '#654');
+        T.px(bx0 + nx + (nw >> 1), by0 + ny, '#a12');                 // pin / wax seal
+      }
+    }, { outline: true });
+
+    // ---- the hooded stranger in the corner ----
+    paintStranger(S, L);
+  }
+
+  function paintStranger(S, L) {
+    const { x, y } = L.fig, ct = L.ctab;
+    const CLOAK = ['#000', '#101', '#111', '#112', '#212', '#223', '#323', '#334'];
+    // the stranger's own small table
+    layer(S, T => {
+      T.rect(ct.x0, ct.y, ct.x1 - ct.x0, 2, '#532'); T.rect(ct.x0, ct.y, ct.x1 - ct.x0, 1, '#643');
+      T.rect(ct.x0, ct.y + 2, ct.x1 - ct.x0, 3, '#210'); T.rect(ct.x0 + 2, ct.y + 5, 2, L.yF + 4 - ct.y - 5, '#100');
+    });
+    layer(S, T => {
+      // cloak: broad shoulders falling to the bench
+      T.poly([[x - 4, y + 9], [x + 6, y + 9], [x + 14, y + 20], [x + 16, ct.y + 2], [x - 15, ct.y + 2], [x - 12, y + 19]], CLOAK, { grad: [x - 14, y + 10, x + 14, ct.y, 0.55, 0.2] });
+      // fold lines
+      T.line(x - 6, y + 16, x - 9, ct.y, '#000'); T.line(x + 4, y + 15, x + 7, ct.y, '#000'); T.line(x - 1, y + 17, x - 1, ct.y, '#101');
+      // hood: a deep cowl, peak tipped back
+      T.poly([[x + 1, y], [x + 6, y + 4], [x + 8, y + 11], [x + 5, y + 16], [x - 7, y + 16], [x - 9, y + 10], [x - 6, y + 3]], CLOAK, { grad: [x - 8, y, x + 8, y + 16, 0.7, 0.25] });
+      // the dark of the hood's opening
+      T.poly([[x - 6, y + 7], [x + 1, y + 5], [x + 3, y + 10], [x + 1, y + 15], [x - 6, y + 15], [x - 7.5, y + 11]], ['#000'], { tone: 0 });
+      // two faint eyes in the dark
+      T.px(x - 4, y + 10, '#764'); T.px(x - 1, y + 10, '#764');
+      // sleeve and gloved hand reaching for the tankard
+      T.capsule(x - 9, y + 20, x - 14, ct.y - 2, 2.6, 2.2, CLOAK, { hi: 5 });
+      T.ball(x - 15, ct.y - 2, 1.8, 1.5, ['#100', '#211', '#322', '#432']);
+      // pipe: stem from the hood's shadow, bowl glowing
+      T.line(x - 3, y + 14, L.pipe.x + 1, L.pipe.y - 1, '#321');
+      T.rect(L.pipe.x - 1, L.pipe.y - 2, 3, 3, '#321'); T.rect(L.pipe.x - 1, L.pipe.y - 2, 3, 1, '#a41');
+      // tankard on the corner table
+      // firelight rims the cloak's left edges (the side facing the hearth), from the layer's own mask
+      const src = T.data.slice(), W2 = T.w, black = P.toInt('#000');
+      for (let yy = y; yy < ct.y; yy++) for (let xx = x - 17; xx < x + 8; xx++) {
+        const v = src[yy * W2 + xx];
+        if (!v || v === black || src[yy * W2 + xx - 1]) continue;
+        T.set(xx, yy, yy < y + 16 ? '#643' : '#421');
+        const n = src[yy * W2 + xx + 1];
+        if (yy < y + 14 && n && n !== black) T.set(xx + 1, yy, '#322');
+      }
+      T.capsule(ct.x0 + 7, ct.y - 6, ct.x0 + 7, ct.y - 1, 2.3, 2.3, R_PEWTER, { hi: 5 });
+      T.horn(ct.x0 + 9, ct.y - 5, ct.x0 + 12, ct.y - 4, ct.x0 + 9, ct.y - 2, 0.6, 0.6, R_PEWTER, { hi: 4 });
+    }, { light: [-0.9, -0.1, 0.4], ambient: 0.05 });
+  }
+
+  function innAnim(ctx, ox, oy, w, h, t) {
+    const L = innLayout(w, h), F2 = L.fp;
+    const f = Math.floor(t * 11) % NF;
+    const fw = F2.ox1 - F2.ox0 - 4, fh = L.yF - F2.oTop - 2;
+    const fire = K.cached(`dw27|infire|${fw}|${fh}|${f}`, fw, fh, S => {
+      paintFire(S, [
+        { cx: fw * 0.5, base: fh - 4, h: fh * 0.92, hw: 6, sway: 1.8, ph: 0 },
+        { cx: fw * 0.3, base: fh - 4, h: fh * 0.62, hw: 4.5, sway: 1.5, ph: 2.2 },
+        { cx: fw * 0.7, base: fh - 3, h: fh * 0.72, hw: 4.5, sway: 1.6, ph: 4.1 },
+        { cx: fw * 0.15, base: fh - 3, h: fh * 0.35, hw: 3, sway: 1, ph: 1.1 },
+        { cx: fw * 0.86, base: fh - 3, h: fh * 0.4, hw: 3, sway: 1, ph: 5.3 },
+      ], f, { lo: 2 });
+    });
+    G.blit(fire, ox + F2.ox0 + 2, oy + F2.oTop + 1, { ctx });
+    // the front log sits over the flames' roots
+    G.blit(K.cached('dw27|inlog3', 36, 11, S => {
+      const BARK = ['#100', '#210', '#310', '#421', '#532', '#643'];
+      const lg = { light: K.norm3([-0.4, -0.8, 0.45]) };
+      for (let x = 4; x < 32; x++) for (let y = 7; y < 11; y++) S.set(x, y, FIRE[(hash2(x, y, 8) * 4 | 0) + (y < 9 ? 1 : 0)]);   // coal bed
+      S.capsule(3, 8, 20, 4, 2.4, 2.2, BARK, lg);
+      S.capsule(15, 4, 32, 8, 2.4, 2.4, BARK, lg);
+      // bark furrows and the fire licking the top edges
+      for (let x = 2; x < 34; x += 3) for (let y = 2; y < 11; y++) if (S.opaque(x, y) && hash2(x, y, 3) > 0.5) S.set(x, y, '#210');
+      S.recolor((x, y) => !S.opaque(x, y - 1) && x > 4 && x < 31, (hx, x) => (x % 3 === 0 ? '#fa2' : '#c40'));
+      // glowing cut ends
+      S.ellipse(2, 8, 1.4, 2, '#a41'); S.px(2, 8, '#fa2');
+      S.ellipse(33, 8, 1.4, 2.2, '#c52'); S.px(33, 8, '#fd5');
+      S.outline('#100');
+    }), ox + L.fire.x - 18, oy + L.yF - 10, { ctx });
+    const sp = remember(`inSp|${w}x${h}`, () => {
+      const r = U.rng(9), out = [];
+      for (let i = 0; i < 8; i++) out.push({ x: L.fire.x - 12 + r() * 24, y: L.yF - 8, rise: 10 + r() * 14, rate: 0.4 + r() * 0.6, ph: r(), wob: 3, amp: 1, dx: (r() - 0.5) * 6 });
+      return out;
+    });
+    drawEmbers(ctx, sp, t, ox, oy);
+    // candles
+    L.candles.forEach((c, i) => G.blit(candleFlame((Math.floor(t * 8) + i * 3) % 4), ox + c.x - 2, oy + c.y - 5, { ctx }));
+    // the stranger draws on the pipe: the ember swells, then a slow curl of smoke
+    const cyc = (t % 6) / 6;
+    const draw = cyc < 0.12 ? cyc / 0.12 : cyc < 0.3 ? 1 - (cyc - 0.12) / 0.18 : 0;
+    const p = L.pipe;
+    G.rect(ox + p.x - 1, oy + p.y - 2, 3, 1, draw > 0.5 ? '#fd5' : draw > 0.1 ? '#e70' : '#a41', ctx);
+    if (draw > 0.3) G.blit(haloSprite(4, draw * 0.5, '#c40'), ox + p.x - 4, oy + p.y - 6, { ctx });
+    for (let i = 0; i < 4; i++) {
+      const life = ((t * 0.15 + i / 4) % 1);
+      const sx = p.x - 2 - life * 10 + Math.sin(t * 0.8 + i * 1.7 + life * 5) * (0.5 + life * 2);
+      const sy = p.y - 4 - life * 18;
+      if (life > 0.85) continue;
+      const r = life < 0.45 ? 1 : 2;
+      G.blit(K.cached(`dw27|smoke|${r}|${life < 0.5 ? 0 : 1}`, r * 2 + 1, r * 2 + 1, S => {
+        const c = life < 0.5 ? ['#323', '#545'] : ['#212', '#323'];
+        if (r === 1) { S.rect(0, 1, 3, 1, c[0]); S.rect(1, 0, 1, 3, c[0]); S.px(1, 1, c[1]); return; }
+        S.rect(1, 0, 3, 5, c[0]); S.rect(0, 1, 5, 3, c[0]); S.rect(1, 1, 2, 2, c[1]);
+      }), ox + Math.round(sx) - r, oy + Math.round(sy) - r, { ctx });
+    }
+    // now and then, the eyes catch the light
+    const blink = (t % 7.3) < 0.18 ? 0 : 1;
+    const glint = (t % 7.3) > 3 && (t % 7.3) < 3.6;
+    const ex = L.fig.x - 4, ey = L.fig.y + 10;
+    G.rect(ox + ex, oy + ey, 1, 1, blink ? (glint ? '#ec8' : '#764') : '#000', ctx);
+    G.rect(ox + ex + 3, oy + ey, 1, 1, blink ? (glint ? '#ec8' : '#764') : '#000', ctx);
+  }
+
+  A.scenes['inn'] = { paint: paintInn, animate: innAnim };
 
 })();
 

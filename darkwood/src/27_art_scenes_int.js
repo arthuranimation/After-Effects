@@ -126,7 +126,8 @@
   });
 
   // Warm halo sprite blitted over a light source for flicker (sparse dither dots).
-  const haloSprite = (r, lv, col) => K.cached(`dw27|halo|${r}|${lv}|${col}`, r * 2 + 1, r * 2 + 1, S => {
+  const haloSprite = (r, lv, col) => haloQ(r, Math.round(clamp(lv, 0, 1) * 8) / 8, col);   // quantised: bounded cache
+  const haloQ = (r, lv, col) => K.cached(`dw27|halo|${r}|${lv}|${col}`, r * 2 + 1, r * 2 + 1, S => {
     for (let y = 0; y <= r * 2; y++) for (let x = 0; x <= r * 2; x++) {
       const d = Math.hypot(x - r, y - r) / (r + 0.5);
       if (d >= 1) continue;
@@ -318,6 +319,19 @@
         const sA = n * 22;
         if (Math.abs(sA) < sEdge + 11) L.arches2.push({ s: sA, g: [0.5, 0, 0.8, 0.3, 0, 0.6][((n % 6) + 6) % 6] });
       }
+      // per-column lookups so the per-pixel pass stays cheap
+      L.pilD = new Float32Array(w); L.aisD = new Float32Array(w); L.g1 = new Float32Array(w); L.g2 = new Float32Array(w);
+      for (let x = 0; x < w; x++) {
+        const s0 = L.s[x];
+        let best = 1e9;
+        for (const p of L.pilasters) if (Math.abs(s0 - p) < Math.abs(best)) best = s0 - p;
+        L.pilD[x] = best;
+        let ab = 1e9;
+        for (const a2 of L.aisles) if (Math.abs(s0 - a2) < Math.abs(ab)) ab = s0 - a2;
+        L.aisD[x] = Math.abs(ab);
+        L.g1[x] = archGlow(L.arches1, s0, 30);
+        L.g2[x] = archGlow(L.arches2, s0, 22);
+      }
       // a moon over the rim when the stage is tall enough to show sky
       {
         const mx = Math.round(w * 0.2), skyH = L.yOf(mx, AZ.attic + 20);
@@ -430,17 +444,17 @@
       if (as < 13 && z < 13 + Math.sqrt(Math.max(0, 169 - s * s))) {
         const r = Math.hypot(s, Math.max(0, z - 13));
         if (as < 9.5 && (z < 13 || r < 9.5)) {
-          // portcullis over a black passage with a faint ember glow deep inside
-          const bar = Math.abs(((s + 100) % 3.2) - 1.6) < 0.55;
+          // portcullis silhouetted against an ember glow from the pens deep inside
+          const glow = Math.max(0, 1 - Math.hypot(s / 9, (z - 2) / 15)) * (0.75 + 0.25 * vnoise(s * 0.4, z * 0.3, 71));
+          const sb = ((s + 100) % 3.2), bar = Math.abs(sb - 1.6) < 0.55;
           const rail = ((z + 100) % 5) < 1;
           if ((bar || rail) && z > 0.5) {
-            const left = ((s + 100) % 3.2) < 1.1;
-            M.b = bar && left ? 0.34 : 0.22; M.w = 0.05; M.lit = 0.6;
-            if (z < 2.5 && bar) M.b = 0.4;   // spike tips
+            M.b = bar && sb < 1.15 ? 0.2 : 0.1; M.w = 0.1; M.lit = 0.4;
+            if (z < 2.5 && bar) M.b = 0.3;
             return;
           }
-          M.lit = 0.15;
-          M.b = 0.05 + 0.1 * smooth(14, 0, z); M.w = 0.55;
+          M.lit = 0.1;
+          M.b = 0.06 + 0.5 * glow * glow; M.w = 0.5 + glow * 0.5;
           return;
         }
         // arch ring + jambs
@@ -448,8 +462,8 @@
           const ang = Math.atan2(z - 13, s);
           const seg = ang / (Math.PI / 7);
           if (Math.abs(seg - Math.round(seg)) < 0.09 || r > 12.6) { M.b = 0.13; return; }
-          M.b = Math.abs(ang - Math.PI / 2) < 0.16 ? 0.46 : 0.36 - (s > 0 ? 0.05 : 0);
-          if (r < 10.5) M.b -= 0.06;
+          M.b = Math.abs(ang - Math.PI / 2) < 0.16 ? 0.5 : 0.42 - (s > 0 ? 0.06 : 0);
+          if (r < 10.5) { M.b = 0.3; M.w = 0.45; }
           return;
         }
         const zc = (z + 1) % 5;
@@ -458,13 +472,13 @@
         return;
       }
       // pilasters
-      for (const p of L.pilasters) {
-        const d = s - p, ad = Math.abs(d);
+      {
+        const d = L.pilD[x], p = Math.round(s - d), ad = Math.abs(d);
         const wide = z < 3 || z > AZ.pod - 4;
         if (ad < (wide ? 5.5 : 4.5)) {
           const zc = (z + 2) % 8;
           if (zc < 1 || (wide && (z > 2 && z < 3 || z > AZ.pod - 4 && z < AZ.pod - 3))) { M.b = 0.13; return; }
-          M.b = 0.38 + hash2(Math.floor(z / 8), p | 0, 3) * 0.05;
+          M.b = 0.38 + hash2(Math.floor(z / 8), p | 0, 3) * 0.05 + (vnoise(s * 0.5, z * 0.4, 23) - 0.5) * 0.1;
           if (d < (wide ? -4.5 : -3.5)) M.b += 0.12;
           else if (d > (wide ? 3.5 : 2.5)) M.b -= 0.14;
           if (zc > 7) M.b += 0.06;
@@ -477,7 +491,7 @@
       M.b = ashlar(POD_C[ci % POD_C.length], s, zc, 6, ci);
       M.b += (vnoise(s * 0.3, z * 0.45, 3) - 0.5) * 0.1;
       // cast shadow right of each pilaster, under the coping
-      for (const p of L.pilasters) { const d = s - p; if (d > 4.5 && d < 8) { M.b *= 0.62; break; } }
+      { const d = L.pilD[x]; if (d > 4.5 && d < 8) M.b *= 0.62; }
       if (z > AZ.pod - 3) M.b *= 0.72;
       // rain streaks and dried blood low on the wall
       const st = vnoise(s * 0.45, 0.5, 9);
@@ -495,8 +509,8 @@
     }
     // ---------------- stands (crowd painted afterwards) ----------------
     if (z < AZ.stands) {
-      for (const a of L.aisles) {
-        const d = Math.abs(s - a);
+      {
+        const d = L.aisD[x];
         if (d < 3.5) { M.b = ((z + 400) % 2) < 1 ? 0.3 : 0.15; return; }
         if (d < 4.5) { M.b = 0.36; return; }
       }
@@ -518,7 +532,7 @@
       if (ads < R && (z < zs || r < R)) {
         // gallery interior: a low parapet, then darkness with a warm back-glow
         if (z < 63) { M.b = z > 62 ? 0.32 : 0.2; M.lit = 0.5; return; }
-        const g = archGlow(L.arches1, s, 30);
+        const g = L.g1[x];
         M.lit = 0.2;
         M.b = 0.04 + g * 0.42 * smooth(zs + 6, 64, z) * (1 - 0.35 * (ads / R));
         M.w = 0.35 + g * 0.65;
@@ -563,7 +577,7 @@
       const r = Math.hypot(ds, z - zs);
       if (ads < R && (z < zs || r < R) && z > AZ.cor1 + 1) {
         if (z < 113) { M.b = 0.24; M.lit = 0.5; return; }
-        const g = archGlow(L.arches2, s, 22);
+        const g = L.g2[x];
         M.lit = 0.2;
         M.b = 0.03 + g * 0.34 * smooth(zs + 4, 113, z);
         M.w = 0.3 + g * 0.6;
@@ -610,6 +624,14 @@
     const sandBottom = h - L.floorC;
 
     const gore = new Uint8Array(w * h);
+    // blood stains that can touch each sand row (depth is nearly constant along a row)
+    const rowStains = [];
+    for (let y = 0; y < h; y++) {
+      const list = [];
+      const Dc = (L.floorC - yhF) / (y + 0.5 - yhF), De = (L.yF[0] - yhF) / (y + 0.5 - yhF);
+      for (const st0 of L.stains) if (Math.min(Math.abs(Dc - st0.D), Math.abs(De - st0.D)) < st0.rd * 1.7 + 0.01 || (st0.D > Math.min(Dc, De) && st0.D < Math.max(Dc, De))) list.push(st0);
+      rowStains.push(list);
+    }
     // ---------- per-pixel wall + floor ----------
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
@@ -656,11 +678,11 @@
         const tl = torchLight(L, x, y, 2.4);
         b += 0.22 * tl; wm += 0.8 * tl;
         // grain, low mottling and faint wind ripples (finer with distance)
-        b += (hash2(x, y, 5) - 0.5) * 0.05 + (fbm(X * 0.05, D * 6, 13, 2) - 0.5) * 0.1;
+        b += (hash2(x, y, 5) - 0.5) * 0.05 + (vnoise(X * 0.05, D * 6, 13) - 0.5) * 0.11;
         b += 0.025 * Math.sin(D * 64 + vnoise(X * 0.04, D * 3, 8) * 5);
         // old blood soaked into the sand
         let g = 0, nz = -1;
-        for (const st0 of L.stains) {
+        for (const st0 of rowStains[y]) {
           const dx = (X - st0.X) / st0.rx;
           if (dx > 1.6 || dx < -1.6) continue;
           const dd = (D - st0.D) / st0.rd;
@@ -1064,10 +1086,8 @@
   // Hue-shifted ramps: cool blue-violet shadows climbing to warm highlights,
   // so every prop sits in "firelight against the night" without extra work.
   const R_STEEL = ['#001', '#112', '#223', '#334', '#545', '#765', '#a86', '#dc9', '#ffd'];
-  const R_COLD = ['#001', '#012', '#123', '#234', '#346', '#568', '#89b', '#bce'];
   const R_WOOD = ['#000', '#100', '#210', '#320', '#431', '#642', '#863', '#a75'];
   const R_LEATH = ['#100', '#200', '#310', '#420', '#531', '#742', '#953'];
-  const R_SOOT = ['#000', '#101', '#111', '#212', '#322', '#432', '#643', '#854'];
   const R_BRASS = ['#100', '#210', '#430', '#640', '#861', '#b82', '#da4', '#fd7'];
 
   // Bayer-dithered pick along a single ramp, v in 0..1.
@@ -1479,5 +1499,668 @@
   }
 
   A.scenes['smithy'] = { paint: paintSmithy, animate: smithyAnim };
+
+  // ================================================================
+  // APOTHECARY — shelves of glowing bottles, a bubbling cauldron,
+  // drying herbs, a candle-crowned skull, mystical purples
+  // ================================================================
+  const AP_WALL = [
+    ['#000', '#101', '#102', '#203', '#213', '#314', '#324', '#425', '#435', '#536'],   // violet gloom
+    ['#100', '#101', '#201', '#212', '#312', '#322', '#423', '#533', '#634', '#745'],   // violet → amber
+    ['#100', '#200', '#210', '#311', '#421', '#532', '#642', '#753', '#864', '#a75'],   // candle amber
+    ['#001', '#011', '#012', '#112', '#122', '#223', '#233', '#334', '#344', '#455'],   // violet → green
+    ['#000', '#010', '#021', '#121', '#132', '#242', '#253', '#363', '#474', '#6a6'],   // cauldron green
+  ];
+  const LIQ = {
+    g: ['#010', '#031', '#062', '#0a4', '#3d6', '#9f9'],
+    r: ['#100', '#301', '#601', '#a12', '#e33', '#f88'],
+    b: ['#001', '#012', '#035', '#16a', '#3ae', '#9ef'],
+    a: ['#100', '#210', '#520', '#a50', '#e90', '#fd6'],
+    p: ['#101', '#102', '#305', '#629', '#a4d', '#d9f'],
+  };
+  const GLASS = ['#101', '#112', '#223', '#334', '#556', '#889'];
+
+  // Bottle shapes: half-width profile from the base up, neck rows, cork half-width.
+  const BOTTLES = {
+    flask: { body: [3, 4.5, 5.5, 6, 6, 5.5, 4.5, 3, 1.8], neck: [1.2, 1.2, 1.2, 1.5], cork: 1.5 },
+    vial: { body: [2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 2.2, 1.6], neck: [1.2, 1.2], cork: 1.5 },
+    square: { body: [3.5, 3.5, 3.5, 3.5, 3.5, 3.5, 3.5, 3.5, 2.5, 1.5], neck: [1.2, 1.2], cork: 1.7 },
+    jar: { body: [4, 5, 5, 5, 5, 5, 5, 5, 4.5], neck: [4], cork: 5.5 },
+    gourd: { body: [3, 4, 4.4, 4, 2.6, 1.6, 2.8, 3.2, 2.6, 1.4], neck: [1, 1, 1], cork: 1.4 },
+    tall: { body: [2.6, 3, 3.2, 3.2, 3.2, 3.2, 3.2, 3.2, 3, 2.5, 1.8, 1.1], neck: [1, 1, 1, 1], cork: 1.4 },
+    phial: { body: [2.5, 3.2, 3.4, 3, 2, 1.2], neck: [0.8, 0.8], cork: 1.2 },
+  };
+  // Paint one bottle standing on (x, base).
+  function paintBottle(S, x, base, kind, liq, fill) {
+    const B = BOTTLES[kind], L2 = LIQ[liq];
+    const rows = B.body.length;
+    const lvl = Math.round(rows * fill);
+    for (let j = 0; j < rows; j++) {
+      const hw = B.body[j], y = base - 1 - j;
+      for (let i = Math.floor(-hw); i < Math.ceil(hw); i++) {
+        const u0 = (i + 0.5) / hw;
+        const xx = Math.round(x + i);
+        let col;
+        if (j < lvl) {
+          const v = 3.6 - Math.abs(u0) * 1.8 - (j / rows) * 0.9 + (u0 < 0 ? 0.25 : 0);
+          col = L2[clamp(Math.round(v + (TH(xx, y) - 0.5)), 1, 5)];
+          if (j === lvl - 1 && Math.abs(u0) < 0.7) col = L2[4];
+        } else col = Math.abs(u0) > 0.55 ? GLASS[2] : GLASS[1];
+        if (Math.abs(u0) > 0.82) col = j < lvl ? L2[1] : GLASS[2];
+        S.set(xx, y, col);
+      }
+    }
+    for (let j = 0; j < B.neck.length; j++) {
+      const hw = B.neck[j], y = base - 1 - rows - j;
+      for (let i = Math.floor(-hw); i < Math.ceil(hw); i++) S.set(Math.round(x + i), y, i < 0 ? GLASS[4] : GLASS[2]);
+    }
+    const cy = base - 1 - rows - B.neck.length;
+    for (let i = Math.floor(-B.cork); i < Math.ceil(B.cork); i++) { S.set(Math.round(x + i), cy, i < 0 ? '#975' : '#642'); S.set(Math.round(x + i), cy - 1, i < 0 ? '#753' : '#531'); }
+    // glass highlights (upper left) — a streak and a spark
+    const hj = Math.max(1, Math.floor(rows * 0.62));
+    const hx = Math.round(x - B.body[hj] + 1.2);
+    S.set(hx, base - 1 - hj, '#eef'); S.set(hx, base - hj, '#99b');
+    if (rows > 6) S.set(hx, base - 2 - hj, '#99b');
+    return rows + B.neck.length + 2;
+  }
+
+  function apoLayout(w, h) {
+    return remember(`ap|${w}x${h}`, () => {
+      const L = { w, h };
+      L.yF = h - 20;
+      L.cau = { x: 33, y: L.yF - 27, rx: 26 };                    // rim centre
+      L.sx0 = 72; L.sx1 = w - 5;
+      L.shelves = [L.yF - 44, L.yF - 20];
+      L.skull = { x: L.sx1 - 14, y: L.shelves[0] };
+      L.ball = { x: L.sx1 - 13, y: L.shelves[1] };
+      L.candles = [{ x: L.skull.x + 1, y: L.shelves[0] - 17 }, { x: L.sx0 + 5, y: L.shelves[1] - 10 }];
+      const rnd = U.rng(313);
+      const kinds = ['flask', 'vial', 'square', 'gourd', 'tall', 'phial', 'flask', 'phial'];
+      const liqs = ['g', 'r', 'b', 'g', 'r', 'b', 'a', 'p', 'g'];
+      L.bottles = [];
+      L.shelves.forEach((sy, si) => {
+        let x = L.sx0 + (si === 1 ? 11 : 3);
+        const stop = si === 0 ? L.skull.x - 8 : L.ball.x - 8;
+        let n = 0;
+        while (x < stop) {
+          if (si === 0 && n === 0) { L.bottles.push({ kind: 'books', x, y: sy }); x += 16; n++; continue; }
+          if (si === 0 && n === 2) { L.bottles.push({ kind: 'jar', x: x + 5, y: sy, liq: 'g', fill: 0.9, eye: true, ph: 1 }); x += 12; n++; continue; }
+          if (si === 1 && n === 3 && x + 12 < stop) { L.bottles.push({ kind: 'mortar', x: x + 5, y: sy }); x += 13; n++; continue; }
+          const kind = kinds[Math.floor(rnd() * kinds.length)];
+          const hw = Math.ceil(Math.max(...BOTTLES[kind].body, BOTTLES[kind].cork));
+          if (x + hw * 2 > stop) break;
+          L.bottles.push({ kind, x: x + hw, y: sy, liq: liqs[Math.floor(rnd() * liqs.length)], fill: 0.4 + rnd() * 0.5, ph: rnd() * 10 });
+          x += hw * 2 + (rnd() < 0.3 ? 4 : 1);
+          n++;
+        }
+      });
+      // things hanging from the beam (away from the back button)
+      L.herbs = [];
+      let hx = 50, i = 0;
+      while (hx < w - 8) {
+        L.herbs.push({ x: hx, kind: [0, 1, 4, 2, 0, 3, 1, 2, 0, 4][i % 10], len: clamp(L.shelves[0] - 24, 5, 7 + Math.floor(rnd() * 5)) });
+        hx += 17 + Math.floor(rnd() * 9); i++;
+      }
+      return L;
+    });
+  }
+
+  function paintApothecary(S, w, h) {
+    const L = apoLayout(w, h);
+    const C = L.cau;
+    const lights = [];
+    for (const c of L.candles) lights.push({ x: c.x, y: c.y + 2, r: 44, i: 0.9, k: 1 });
+    lights.push({ x: C.x + 2, y: C.y - 2, r: 86, i: 1.2, k: 2 });
+    const lightAt = (x, y) => {
+      let warm = 0, green = 0;
+      for (const l of lights) {
+        const a = falloff(x, y, l.x, l.y, l.r) * l.i;
+        if (l.k === 1) warm += a; else green += a;
+      }
+      return [warm, green];
+    };
+    const pickAp = (b, warm, green, x, y) => {
+      const tint = green > warm ? green : warm;
+      const v = clamp(tint * 2.4, 0, 2);
+      let ti = Math.floor(v); if (v - ti > TH(x + 2, y + 3)) ti++;
+      const row = ti === 0 ? 0 : green > warm ? 2 + ti : ti;
+      const g = AP_WALL[Math.min(4, row)], bv = clamp(b, 0, 1) * (g.length - 1);
+      let i = Math.floor(bv); if (bv - i > TH(x, y)) i++;
+      return g[Math.min(g.length - 1, i)];
+    };
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const [warm, green] = lightAt(x, y);
+      const amb = 0.72 + 1.1 * (warm + green);
+      if (y < 5) {                                             // ceiling beam
+        let b = y === 4 ? 0.1 : y === 3 ? 0.38 : 0.26;
+        b += (vnoise(x * 0.15, y, 4) - 0.5) * 0.12;
+        S.set(x, y, pickAp(b * amb, warm, green, x, y));
+        continue;
+      }
+      if (y >= L.yF) {                                         // floorboards
+        const yy = y - L.yF, plank = Math.floor(yy / 4);
+        let b = (yy % 4 === 3) ? 0.1 : 0.3 + hash2(plank, Math.floor((x + plank * 13) / 31), 3) * 0.08;
+        if (((x + plank * 13) % 31) === 0) b = 0.1;
+        S.set(x, y, pickAp(b * (0.4 + amb * 0.5), warm, green, x, y));
+        continue;
+      }
+      // dark timber panelling: vertical boards with grain, a rail along the wainscot
+      const bx = Math.floor((x + 4) / 9), lx = (x + 4) - bx * 9;
+      let b = 0.27 + hash2(bx, 0, 41) * 0.07;
+      b += (vnoise(x * 0.9, y * 0.06 + bx * 3, 19) - 0.5) * 0.12;
+      if (lx === 0) b = 0.08; else if (lx === 1) b += 0.06; else if (lx === 8) b -= 0.06;
+      if (hash2(bx, Math.floor(y / 3), 42) > 0.985) b = 0.1;                // knot
+      if (y === L.yF - 12) b = 0.42; else if (y === L.yF - 11) b = 0.26; else if (y === L.yF - 10) b = 0.08;
+      S.set(x, y, pickAp(b * amb, warm, green, x, y));
+    }
+
+    // ---- shelves on iron brackets ----
+    layer(S, T => {
+      for (const sy of L.shelves) {
+        T.rect(L.sx0, sy, L.sx1 - L.sx0, 1, '#753');
+        T.rect(L.sx0, sy + 1, L.sx1 - L.sx0, 2, '#421');
+        T.rect(L.sx0, sy + 3, L.sx1 - L.sx0, 1, '#210');
+        for (const bx of [L.sx0 + 6, L.sx1 - 8]) { T.line(bx, sy + 4, bx + 3, sy + 4, '#223'); T.line(bx, sy + 4, bx, sy + 7, '#223'); T.line(bx, sy + 7, bx + 3, sy + 4, '#112'); }
+      }
+    });
+
+    // ---- bottles, books, the specimen jar, the mortar ----
+    const B = K.create(w, h);
+    for (const b of L.bottles) {
+      if (b.kind === 'books') {
+        const cols = [['#412', '#734'], ['#132', '#364'], ['#213', '#436'], ['#320', '#653']];
+        let x = b.x;
+        for (let i = 0; i < 4; i++) {
+          const [d, l] = cols[i % 4], bh = 11 + ((i * 5 + 1) % 4), bw = 2 + (i & 1);
+          B.rect(x, b.y - bh, bw, bh, d); B.rect(x, b.y - bh, 1, bh, l);
+          B.rect(x, b.y - bh + 2, bw, 1, '#a83'); B.rect(x, b.y - 3, bw, 1, '#a83');
+          x += bw;
+        }
+        B.poly([[x, b.y], [x + 2, b.y], [x + 7, b.y - 11], [x + 5, b.y - 12]], ['#100', '#301', '#412', '#623'], { tone: 0.5 });   // a leaning tome
+      } else if (b.kind === 'mortar') {
+        B.ball(b.x, b.y - 3, 4.5, 3.2, ['#101', '#212', '#323', '#434', '#656', '#878']);
+        B.rect(b.x - 4, b.y - 6, 9, 1, '#545');
+        B.capsule(b.x + 1, b.y - 6, b.x + 5, b.y - 11, 1, 0.9, ['#101', '#323', '#545', '#767']);
+      } else {
+        paintBottle(B, b.x, b.y, b.kind, b.liq, b.fill);
+        if (b.eye) {                                     // something pickled, staring back
+          B.ball(b.x, b.y - 5, 2.6, 2.6, ['#433', '#655', '#988', '#cba', '#edc']);
+          B.px(b.x - 1, b.y - 5, '#a12'); B.px(b.x, b.y - 5, '#100'); B.px(b.x, b.y - 6, '#a12');
+        }
+      }
+    }
+    B.outline('#101');
+    // glow halos behind the bottles
+    for (const b of L.bottles) {
+      if (!b.liq) continue;
+      const g = LIQ[b.liq];
+      for (let y = b.y - 20; y < b.y; y++) for (let x = b.x - 10; x <= b.x + 10; x++) {
+        if (B.opaque(x, y) || !S.opaque(x, y)) continue;
+        const a = falloff(x, y, b.x, b.y - 5, 11);
+        if (a > TH(x, y) + 0.12) S.set(x, y, a > 0.45 ? g[2] : g[1]);
+      }
+    }
+    S.stamp(B, 0, 0);
+
+    // ---- the skull crowned with a guttering candle ----
+    layer(S, T => {
+      const { x, y } = L.skull;
+      const BONE = ['#100', '#211', '#432', '#654', '#876', '#a98', '#cba', '#edc'];
+      T.ball(x, y - 7, 6.5, 6, BONE, { spec: 0.2 });
+      T.ball(x + 0.5, y - 2.5, 4, 2.5, BONE, { hi: 5 });
+      T.rect(x - 5, y - 8, 4, 3, '#100'); T.rect(x + 1, y - 8, 4, 3, '#100');
+      T.px(x - 4, y - 7, '#601'); T.px(x + 2, y - 7, '#601');
+      T.px(x, y - 4, '#211'); T.px(x - 1, y - 4, '#321');
+      for (let i = -3; i <= 3; i += 2) T.px(x + i, y - 1, '#321');
+      T.rect(x - 1, y - 17, 4, 6, '#dcb'); T.rect(x - 1, y - 17, 1, 6, '#fed'); T.rect(x + 2, y - 17, 1, 6, '#a98');
+      T.rect(x - 3, y - 12, 8, 1, '#dcb'); T.px(x - 3, y - 11, '#cba'); T.px(x + 4, y - 11, '#cba'); T.px(x - 4, y - 10, '#a98'); T.px(x + 4, y - 9, '#a98');
+      T.px(x + 1, y - 18, '#211');
+    }, { light: [-0.5, -0.8, 0.4] });
+
+    // ---- crystal ball on a claw stand ----
+    layer(S, T => {
+      const { x, y } = L.ball;
+      T.poly([[x - 5, y], [x + 5, y], [x + 3, y - 3], [x - 3, y - 3]], R_BRASS, { tone: 0.45 });
+      T.ball(x, y - 9, 6.5, 6.5, ['#102', '#204', '#316', '#428', '#63a', '#94d', '#c7f', '#ebf'], { spec: 1.2, depth: 0.8 });
+      T.px(x - 3, y - 13, '#fff'); T.px(x - 4, y - 12, '#dbf'); T.px(x - 2, y - 13, '#dbf');
+      T.horn(x - 4, y - 3, x - 6, y - 6, x - 5, y - 8, 0.9, 0.5, R_BRASS, { hi: 6 });
+      T.horn(x + 4, y - 3, x + 6, y - 6, x + 5, y - 8, 0.9, 0.5, R_BRASS, { hi: 5 });
+    });
+    for (let y = L.ball.y - 24; y < L.ball.y; y++) for (let x = L.ball.x - 14; x <= L.ball.x + 14; x++) {
+      const a = falloff(x, y, L.ball.x, L.ball.y - 9, 15);
+      const hx = S.getHex(x, y);
+      if (hx && a > TH(x, y) + 0.08 && Math.hypot(x + 0.5 - L.ball.x, y + 0.5 - (L.ball.y - 9)) > 7.2) S.set(x, y, a > 0.4 ? '#527' : '#314');
+    }
+    // the lower candle
+    layer(S, T => {
+      const c = L.candles[1];
+      T.rect(c.x - 1, c.y + 1, 3, 9, '#dcb'); T.rect(c.x - 1, c.y + 1, 1, 9, '#fed'); T.rect(c.x + 1, c.y + 1, 1, 9, '#a98');
+      T.rect(c.x - 2, c.y + 9, 5, 1, '#876'); T.px(c.x - 2, c.y + 4, '#cba');
+      T.px(c.x, c.y, '#211');
+    });
+
+    // ---- herbs, lavender, garlic and a dried bat hang from the beam ----
+    layer(S, T => {
+      for (const hb of L.herbs) {
+        const x = hb.x, y0 = 4;
+        if (hb.kind === 4) {                                       // dried bat, hung by its feet
+          T.line(x, y0, x, y0 + 2, '#432');
+          T.poly([[x - 2.5, y0 + 3], [x + 2.5, y0 + 3], [x + 3.5, y0 + 9], [x, y0 + 11], [x - 3.5, y0 + 9]], ['#101', '#202', '#313', '#424', '#535'], { grad: [x - 3, y0 + 3, x + 3, y0 + 11, 0.85, 0.2] });
+          T.px(x - 1, y0 + 10, '#d33'); T.px(x + 1, y0 + 10, '#d33');
+          T.px(x - 1, y0 + 12, '#101'); T.px(x + 1, y0 + 12, '#101');
+          continue;
+        }
+        T.line(x, y0, x, y0 + 3, '#432');
+        if (hb.kind === 3) {                                       // garlic braid
+          for (let i = 0; i < 3; i++) T.ball(x + (i & 1 ? 1 : -1), y0 + 6 + i * 3.4, 2.3, 2, ['#211', '#543', '#876', '#ba9', '#dcb']);
+          continue;
+        }
+        const leaf = hb.kind === 0 ? ['#010', '#121', '#232', '#353', '#474'] : hb.kind === 1 ? ['#110', '#221', '#342', '#463', '#584'] : ['#101', '#213', '#324', '#436', '#547'];
+        T.rect(x - 1, y0 + 3, 3, 1, '#875');
+        const n = 7 + (hb.len & 3);
+        for (let i = 0; i < n; i++) {
+          const a = -0.55 + i * (1.1 / (n - 1)), len = hb.len * (0.7 + ((i * 7) % 4) * 0.1);
+          T.capsule(x, y0 + 4, x + Math.sin(a) * len * 0.5, y0 + 4 + Math.cos(a) * len, 0.6, 0.9, leaf, { hi: 4 });
+        }
+        if (hb.kind === 2) for (let i = 0; i < 7; i++) T.px(x - 3 + i, y0 + 3 + hb.len - ((i * 3) % 3), i & 1 ? '#a7d' : '#859');
+      }
+    }, { light: [-0.6, -0.7, 0.4] });
+
+    // ---- the cauldron on its fire-stones ----
+    layer(S, T => {
+      const { x, y, rx } = C;
+      const IRON = ['#000', '#101', '#111', '#112', '#212', '#223', '#334', '#445'];
+      for (const [sx, sr] of [[x - 17, 5], [x + 17, 5], [x - 3, 4], [x + 6, 3.5]]) T.ball(sx, L.yF - 1, sr, 3.2, ['#101', '#112', '#212', '#323', '#434', '#545']);
+      for (const sd of [-1, 1]) T.capsule(x + sd * 13, y + 22, x + sd * 16, L.yF - 1, 1.6, 1.1, IRON, { hi: 5 });
+      T.ball(x, y + 11, rx, 15, IRON, { spec: 0.35 });
+      T.capsule(x - rx + 1, y + 1, x + rx - 1, y + 1, 2.4, 2.4, IRON, { hi: 6 });
+      for (const sd of [-1, 1]) { T.ball(x + sd * (rx + 1), y + 6, 2.4, 2.6, IRON, { hi: 6 }); T.px(x + sd * (rx + 1), y + 6, '#000'); }
+      // green light from the brew washing the lip and upper belly
+      T.recolor((px, py) => py > y - 3 && py < y + 6 && Math.abs(px + 0.5 - x) < rx + 4, (hx, px, py) => (py < y + 2 ? (TH(px, py) < 0.65 ? '#364' : '#253') : (TH(px, py) < 0.4 ? '#132' : hx)));
+      T.recolor((px, py) => py === y - 1 && Math.abs(px + 0.5 - x) < rx - 2, () => '#6a6');
+      T.ellipse(x, y + 0.5, rx - 3, 2.4, '#062');
+      for (let i = -rx + 4; i < rx - 3; i++) if (hash2(i, 0, 7) > 0.55) T.px(x + i, y + (i & 1), '#0a4');
+      T.rect(x - 8, y, 12, 1, '#3d6'); T.rect(x - 4, y, 4, 1, '#9f9');
+      // a ladle hooked over the rim
+      T.capsule(x + 10, y - 1, x + 20, y - 13, 0.9, 0.9, R_WOOD, { hi: 6 });
+    }, { light: [-0.6, -0.7, 0.4] });
+  }
+
+  // Fume puff: a soft two-tone blob (solid core, dithered rim), cached by size and shade.
+  const FUME = [['#253', '#364', '#6a6'], ['#142', '#253', '#364'], ['#132', '#142', '#253'], ['#121', '#132', '#142']];
+  const wisp = (r, lv) => K.cached(`dw27|puff|${r}|${lv}`, r * 2 + 2, r * 2 + 2, S => {
+    const c = FUME[lv];
+    for (let y = 0; y < r * 2 + 2; y++) for (let x = 0; x < r * 2 + 2; x++) {
+      const dx = x + 0.5 - r - 1, dy = (y + 0.5 - r - 1) * 1.25;
+      const d = Math.hypot(dx, dy) / (r + 0.5);
+      if (d >= 1) continue;
+      if (d < 0.45) S.set(x, y, dx + dy < -r * 0.3 ? c[2] : c[1]);
+      else if (d < 0.75 || (1 - d) * 3.2 > TH(x, y)) S.set(x, y, c[0]);
+    }
+  });
+
+  function apothecaryAnim(ctx, ox, oy, w, h, t) {
+    const L = apoLayout(w, h), C = L.cau;
+    // fire under the cauldron
+    const f = Math.floor(t * 12) % NF;
+    const fire = K.cached(`dw27|apfire|${f}`, 26, 8, S => {
+      paintFire(S, [
+        { cx: 8, base: 8, h: 7, hw: 3, sway: 1, ph: 0 }, { cx: 13, base: 8, h: 8, hw: 3.2, sway: 1.2, ph: 2 },
+        { cx: 18, base: 8, h: 6.5, hw: 3, sway: 1, ph: 4 },
+      ], f, { lo: 2 });
+    });
+    G.blit(fire, ox + C.x - 13, oy + L.yF - 7, { ctx });
+    // bubbles rising through the brew and popping
+    for (let i = 0; i < 7; i++) {
+      const ph = (t * (0.8 + (i % 3) * 0.3) + i * 0.37) % 1;
+      const bx = C.x - C.rx + 5 + ((i * 11) % (C.rx * 2 - 9));
+      if (ph < 0.6) { G.rect(ox + bx, oy + C.y, 2, 1, '#6e8', ctx); G.rect(ox + bx, oy + C.y - 1, 2, 1, ph < 0.3 ? '#3d6' : '#9f9', ctx); }
+      else if (ph < 0.75) { G.rect(ox + bx - 1, oy + C.y - 1, 1, 1, '#9f9', ctx); G.rect(ox + bx + 2, oy + C.y - 1, 1, 1, '#9f9', ctx); }
+    }
+    // fumes curling up and fading
+    for (let i = 0; i < 7; i++) {
+      const life = (t * 0.14 + i / 7) % 1;
+      const x = C.x + Math.sin(t * 0.8 + i * 2.1 + life * 5) * (2 + life * 7) + (i - 3) * 2.5;
+      const y = C.y - 2 - life * (C.y + 4);
+      const r = Math.round(1.5 + life * 4), lv = Math.min(3, Math.floor(life * 4.4));
+      G.blit(wisp(r, lv), ox + Math.round(x) - r - 1, oy + Math.round(y) - r - 1, { ctx });
+    }
+    // candle flames
+    L.candles.forEach((c, i) => G.blit(candleFlame((Math.floor(t * 9) + i * 2) % 4), ox + c.x - 2, oy + c.y - 5, { ctx }));
+    // a few bottles twinkle with rising specks
+    for (const b of L.bottles) {
+      if (!b.liq || b.kind === 'jar') continue;
+      const ph = (t * 0.7 + b.ph) % 3;
+      if (ph < 1) {
+        const yy = b.y - 2 - Math.floor(ph * 4);
+        G.rect(ox + b.x, oy + yy, 1, 1, LIQ[b.liq][5], ctx);
+      }
+    }
+  }
+
+  A.scenes['apothecary'] = { paint: paintApothecary, animate: apothecaryAnim };
+
+  // ================================================================
+  // INN — The Rusty Flagon's common room: firelight, beams, ale,
+  // and a hooded stranger nursing a pipe in the dark corner
+  // ================================================================
+  const IN_WALL = [
+    ['#000', '#101', '#101', '#111', '#212', '#212', '#322', '#323', '#433', '#434'],
+    ['#000', '#100', '#201', '#211', '#311', '#321', '#422', '#432', '#533', '#643'],
+    ['#100', '#200', '#210', '#320', '#431', '#531', '#642', '#752', '#863', '#974'],
+    ['#100', '#310', '#420', '#531', '#641', '#752', '#863', '#a74', '#c95', '#eb7'],
+  ];
+  const R_PEWTER = ['#101', '#212', '#323', '#434', '#545', '#766', '#987', '#bba'];
+  const R_RUST = ['#100', '#200', '#310', '#420', '#531', '#742', '#953', '#b74'];
+
+  function innLayout(w, h) {
+    return remember(`in|${w}x${h}`, () => {
+      const L = { w, h };
+      L.yF = h - 20;
+      L.fp = { x0: 3, x1: 63, top: L.yF - 50, ox0: 13, ox1: 53, oTop: L.yF - 30 };   // fireplace + opening
+      L.fire = { x: (L.fp.ox0 + L.fp.ox1) / 2, y: L.yF - 8 };
+      L.kegs = { x0: 70, y: L.yF - 14 };
+      L.table = { x0: Math.round(w * 0.5) - 6, x1: Math.round(w * 0.5) + 34, y: L.yF - 15 };
+      L.fig = { x: w - 25, y: L.yF - 50 };                              // hood tip
+      L.ctab = { x0: w - 46, x1: w - 3, y: L.yF - 16 };
+      L.sign = { x: Math.round(w * 0.5) + 14, y: 9 };
+      L.candles = [{ x: L.table.x0 + 22, y: L.table.y - 9 }, { x: L.fp.x0 + 8, y: L.fp.top - 9 }, { x: L.fp.x1 - 9, y: L.fp.top - 7 }];
+      L.pipe = { x: L.fig.x - 12, y: L.fig.y + 21 };
+      return L;
+    });
+  }
+
+  function paintInn(S, w, h) {
+    const L = innLayout(w, h), F2 = L.fp;
+    const lights = [
+      { x: L.fire.x, y: L.fire.y - 4, r: w * 1.05, i: 1.15 },
+      { x: L.candles[0].x, y: L.candles[0].y, r: 34, i: 0.6 },
+      { x: L.candles[1].x, y: L.candles[1].y, r: 26, i: 0.35 },
+      { x: L.candles[2].x, y: L.candles[2].y, r: 26, i: 0.35 },
+    ];
+    const lightAt = (x, y) => {
+      let v = 0;
+      for (const l of lights) v += falloff(x, y, l.x, l.y, l.r) * l.i;
+      // the corner keeps its secrets
+      const dc = Math.hypot(x + 0.5 - L.fig.x, (y + 0.5 - (L.fig.y + 20)) * 0.8);
+      return v * (0.3 + 0.7 * smooth(16, 48, dc));
+    };
+    const timberX = [];
+    for (let x = 66; x < w; x += 38) timberX.push(x);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const lf = lightAt(x, y);
+      // ---- ceiling beam with a lit lower edge ----
+      if (y < 7) {
+        let b = y === 6 ? 0.1 : y === 5 ? 0.45 : 0.3 + (vnoise(x * 0.12, y * 0.5, 6) - 0.5) * 0.14;
+        S.set(x, y, rampPick(R_WOOD, b * (0.45 + lf * 1.2), x, y));
+        continue;
+      }
+      // ---- fireplace: rough stone surround, sooty opening, hearth ----
+      if (x >= F2.x0 && x < F2.x1 && y >= F2.top && y < L.yF) {
+        const inO = x >= F2.ox0 && x < F2.ox1 && y >= F2.oTop;
+        if (inO) {
+          const t = (y - F2.oTop) / (L.yF - F2.oTop);
+          const side = Math.abs(x + 0.5 - L.fire.x) / ((F2.ox1 - F2.ox0) / 2);
+          const b = (0.18 + t * 0.5) * (1 - side * 0.4) + (hash2(x, y, 3) - 0.5) * 0.05;
+          S.set(x, y, pick(IN_WALL, b, 0.7 + t * 0.3, x, y));
+          continue;
+        }
+        if (y < F2.top + 4) {                                   // mantel beam
+          const b = y === F2.top ? 0.5 : y === F2.top + 3 ? 0.12 : 0.34;
+          S.set(x, y, rampPick(R_WOOD, b * (0.5 + lf * 1.1), x, y));
+          continue;
+        }
+        let b = roughStone(x * 1.4, y, 6, 17) * 0.95;
+        if (y >= F2.oTop - 4 && y < F2.oTop && x >= F2.ox0 - 2 && x < F2.ox1 + 2) b = y === F2.oTop - 1 ? 0.6 : 0.4;   // lintel lit from below
+        if (x === F2.x0) b += 0.06; if (x === F2.x1 - 1) b -= 0.08;
+        S.set(x, y, pick(IN_WALL, b * (0.35 + lf * 1.0), 0.3 + lf * 0.9, x, y));
+        continue;
+      }
+      // ---- floorboards ----
+      if (y >= L.yF) {
+        const yy = y - L.yF, plank = Math.floor(yy / 4);
+        let b = (yy % 4 === 3) ? 0.1 : 0.32 + hash2(plank, Math.floor((x + plank * 17) / 29), 3) * 0.08;
+        if (((x + plank * 17) % 29) === 0) b = 0.12;
+        if (yy < 2) b *= 0.6;
+        S.set(x, y, pick(IN_WALL, b * (0.3 + lf * 1.1), lf * 1.0, x, y));
+        continue;
+      }
+      // ---- half-timbered wall: plaster panels in dark oak frames ----
+      const dado = L.yF - 13;
+      let timber = false, tb = 0.3;
+      if (y >= dado) { timber = true; tb = y === dado ? 0.5 : y === dado + 1 ? 0.15 : 0.26 + (((x + 2) % 11 === 0) ? -0.15 : 0); }
+      else if (y >= 22 && y < 26) { timber = true; tb = y === 22 ? 0.45 : y === 25 ? 0.12 : 0.3; }
+      else {
+        for (const tx of timberX) {
+          const d = x - tx;
+          if (d >= 0 && d < 4) { timber = true; tb = d === 0 ? 0.42 : d === 3 ? 0.14 : 0.28; break; }
+          // a diagonal brace in the upper panels
+          const bd = (x - tx - 4) - (y - 7) * 1.4;
+          if (y < 22 && x > tx + 3 && x < tx + 38 && bd >= 0 && bd < 3.2 && ((tx / 38) & 1)) { timber = true; tb = bd < 1 ? 0.4 : bd > 2.2 ? 0.14 : 0.27; break; }
+        }
+      }
+      if (timber) {
+        tb += (vnoise(x * 0.5, y * 0.2, 13) - 0.5) * 0.1;
+        S.set(x, y, rampPick(R_WOOD, tb * (0.5 + lf * 1.15), x, y));
+        continue;
+      }
+      // plaster: soft mottling, cracks, a few bare stones
+      let b = 0.42 + (fbm(x * 0.08, y * 0.1, 31, 3) - 0.5) * 0.18 + (hash2(x, y, 9) - 0.5) * 0.04;
+      if (vnoise(x * 0.06, y * 0.06, 77) > 0.74) b = roughStone(x, y, 4, 5) * 0.9;
+      S.set(x, y, pick(IN_WALL, b * (0.3 + lf * 0.95), lf * 0.95, x, y));
+    }
+
+    // ---- the fire's grate and logs ----
+    layer(S, T => {
+      const fx = L.fire.x, by = L.yF - 2;
+      T.capsule(fx - 13, by - 1, fx + 11, by - 3, 2.2, 2, R_WOOD, { hi: 5 });
+      T.capsule(fx - 9, by - 3, fx + 14, by - 1, 2.1, 2.1, R_WOOD, { hi: 4 });
+      T.ellipse(fx + 14, by - 1, 1.6, 2, '#a52'); T.ellipse(fx - 13, by - 1, 1.6, 2, '#842');
+      T.rect(fx - 16, by + 1, 33, 1, '#212');
+      for (const sd of [-15, 15]) T.capsule(fx + sd, by + 1, fx + sd, by - 6, 0.8, 0.8, R_STEEL, { hi: 4 });
+    });
+    // glowing embers on the hearth floor
+    for (let x = F2.ox0 + 2; x < F2.ox1 - 2; x++) {
+      const y = L.yF - 1;
+      if (hash2(x, 3, 5) > 0.5) S.set(x, y, FIRE[2 + Math.floor(hash2(x, 4, 5) * 3)]);
+    }
+
+    // ---- on the mantel: antlers, tankards, a candle ----
+    layer(S, T => {
+      const ax = L.kegs.x0 + (w >= 260 ? 22 : 15), ay = L.kegs.y - 36;
+      const ANT = ['#100', '#211', '#432', '#654', '#876', '#a98', '#cba'];
+      T.poly([[ax - 3, ay + 1], [ax + 3, ay + 1], [ax + 4, ay + 8], [ax - 4, ay + 8]], R_WOOD, { tone: 0.5 });   // plaque
+      for (const sd of [-1, 1]) {
+        T.horn(ax + sd * 2, ay + 2, ax + sd * 9, ay + 1, ax + sd * 13, ay - 8, 1.2, 0.6, ANT, { hi: 6 });
+        T.horn(ax + sd * 7, ay, ax + sd * 7, ay - 4, ax + sd * 5, ay - 7, 0.8, 0.4, ANT, { hi: 5 });
+        T.horn(ax + sd * 11, ay - 3, ax + sd * 14, ay - 4, ax + sd * 17, ay - 3, 0.7, 0.4, ANT, { hi: 5 });
+      }
+      for (const tx of [F2.x0 + 15, F2.x1 - 16]) {
+        T.capsule(tx, F2.top - 6, tx, F2.top - 1, 2.3, 2.3, R_PEWTER, { hi: 6 });
+        T.rect(tx - 2, F2.top - 7, 5, 1, '#987');
+        T.horn(tx + 2, F2.top - 5, tx + 5, F2.top - 4, tx + 2, F2.top - 2, 0.6, 0.6, R_PEWTER, { hi: 5 });
+      }
+      for (const c of [L.candles[1], L.candles[2]]) {
+        T.rect(c.x - 1, c.y + 1, 2, F2.top - c.y - 1, '#dcb'); T.rect(c.x - 1, c.y + 1, 1, F2.top - c.y - 1, '#fed');
+        T.px(c.x, c.y, '#211');
+      }
+    }, { light: [-0.5, 0.2, 0.6] });
+
+    // ---- kegs racked on the back wall with a shelf of tankards above ----
+    layer(S, T => {
+      const k = L.kegs;
+      const n = w >= 260 ? 3 : 2;
+      T.rect(k.x0 - 2, k.y + 9, n * 15 + 4, 2, '#321');
+      for (let i = 0; i < n; i++) {
+        const kx = k.x0 + 7 + i * 15, ky = k.y;
+        T.ball(kx, ky, 7, 7, R_WOOD, { depth: 0.4, hi: 6 });
+        T.recolor((px, py) => { const d = Math.hypot(px + 0.5 - kx, py + 0.5 - ky); return d > 5.6 && d < 7.2; }, (hx, px, py) => (px + py < kx + ky ? '#765' : '#323'));
+        T.ellipse(kx, ky, 2, 2, '#321');
+        T.rect(kx - 1, ky + 2, 2, 3, '#a83'); T.px(kx - 1, ky + 2, '#dc6');
+      }
+      // shelf + tankards
+      const sy = k.y - 13;
+      T.rect(k.x0 - 2, sy, n * 15 + 4, 2, '#642'); T.rect(k.x0 - 2, sy + 2, n * 15 + 4, 1, '#210');
+      for (let i = 0; i < n * 2; i++) {
+        const tx = k.x0 + 4 + i * 7.5;
+        T.capsule(tx, sy - 6, tx, sy - 1, 2.2, 2.2, i & 1 ? R_PEWTER : R_WOOD, { hi: 6 });
+        T.horn(tx + 2, sy - 5, tx + 4.5, sy - 4, tx + 2, sy - 2, 0.6, 0.6, i & 1 ? R_PEWTER : R_WOOD, { hi: 5 });
+      }
+    }, { light: [-0.8, -0.3, 0.5] });
+
+    // ---- the inn sign: a rusty iron flagon on a bracket ----
+    layer(S, T => {
+      const { x, y } = L.sign;
+      T.capsule(x - 12, y - 1, x + 3, y - 1, 0.8, 0.8, R_STEEL, { hi: 4 });
+      T.line(x - 1, y - 1, x - 1, y + 2, '#223');
+      T.ball(x - 1, y + 9, 6, 7, R_RUST, { depth: 0.6 });
+      T.rect(x - 7, y + 3, 12, 2, '#953'); T.rect(x - 7, y + 3, 4, 1, '#b74');
+      T.horn(x + 5, y + 5, x + 10, y + 7, x + 5, y + 12, 1.1, 1.1, R_RUST, { hi: 6 });
+      T.rect(x - 6, y + 2, 9, 1, '#531'); T.px(x - 7, y + 2, '#742');
+      for (const [dx, dy] of [[-3, 8], [1, 11], [-1, 14]]) T.px(x + dx, y + dy, '#a52');   // rust bloom
+      T.capsule(x - 5, y + 9, x - 5, y + 13, 0.5, 0.5, ['#310', '#742', '#b74']);
+    }, { light: [-0.8, 0.2, 0.55] });
+
+    // ---- centre table: tankards, a plate, a candle ----
+    layer(S, T => {
+      const tb = L.table;
+      T.rect(tb.x0, tb.y, tb.x1 - tb.x0, 2, '#853'); T.rect(tb.x0, tb.y, tb.x1 - tb.x0, 1, '#a75');
+      T.rect(tb.x0, tb.y + 2, tb.x1 - tb.x0, 3, '#421'); T.rect(tb.x0, tb.y + 5, tb.x1 - tb.x0, 1, '#210');
+      for (const lx of [tb.x0 + 2, tb.x1 - 4]) T.rect(lx, tb.y + 6, 2, L.yF + 4 - tb.y - 6, '#310');
+      const c = L.candles[0];
+      T.rect(c.x - 1, c.y + 1, 2, tb.y - c.y - 1, '#dcb'); T.rect(c.x - 1, c.y + 1, 1, tb.y - c.y - 1, '#fed'); T.px(c.x, c.y, '#211');
+      T.rect(c.x - 2, tb.y - 1, 4, 1, '#876');
+      for (const [tx, kind] of [[tb.x0 + 6, 0], [tb.x0 + 13, 1], [tb.x1 - 7, 0]]) {
+        T.capsule(tx, tb.y - 6, tx, tb.y - 1, 2.4, 2.4, kind ? R_PEWTER : R_WOOD, { hi: 6 });
+        T.horn(tx + 2, tb.y - 5, tx + 5, tb.y - 4, tx + 2, tb.y - 2, 0.6, 0.6, kind ? R_PEWTER : R_WOOD, { hi: 5 });
+        T.rect(tx - 2, tb.y - 7, 4, 1, '#ec8');                    // foam
+        T.px(tx - 1, tb.y - 8, '#ffd');
+      }
+      T.ellipse(tb.x1 - 15, tb.y - 1, 4, 1.2, '#654'); T.ball(tb.x1 - 15, tb.y - 2, 2.2, 1.4, ['#310', '#631', '#a63']);   // bread
+    }, { light: [-0.7, -0.4, 0.5] });
+
+    // ---- a notice board of bounties and rumours by the stranger's corner ----
+    layer(S, T => {
+      const bx0 = Math.max(L.table.x1 + 6, L.ctab.x0 - 34), bx1 = L.ctab.x0 - 4, by0 = L.yF - 52, by1 = L.yF - 32;
+      if (bx1 - bx0 < 14) return;
+      T.rect(bx0, by0, bx1 - bx0, by1 - by0, '#321'); T.rect(bx0, by0, bx1 - bx0, 1, '#542'); T.rect(bx0, by0, 1, by1 - by0, '#432');
+      T.rect(bx0 + 1, by1 - 1, bx1 - bx0 - 1, 1, '#100');
+      const notes = [[2, 2, 7, 8, '#a98', '#cb9'], [10, 3, 6, 6, '#987', '#ba9'], [bx1 - bx0 - 9, 2, 7, 9, '#ba9', '#dca'], [5, 11, 8, 6, '#987', '#ba8']];
+      for (const [nx, ny, nw, nh, c0, c1] of notes) {
+        if (nx + nw > bx1 - bx0 - 1 || ny + nh > by1 - by0 - 1) continue;
+        T.rect(bx0 + nx, by0 + ny, nw, nh, c0); T.rect(bx0 + nx, by0 + ny, nw - 1, 1, c1);
+        for (let r = 2; r < nh - 1; r += 2) T.rect(bx0 + nx + 1, by0 + ny + r, nw - 3 - (r & 2 ? 1 : 0), 1, '#654');
+        T.px(bx0 + nx + (nw >> 1), by0 + ny, '#a12');                 // pin / wax seal
+      }
+    }, { outline: true });
+
+    // ---- the hooded stranger in the corner ----
+    paintStranger(S, L);
+  }
+
+  function paintStranger(S, L) {
+    const { x, y } = L.fig, ct = L.ctab;
+    const CLOAK = ['#000', '#101', '#111', '#112', '#212', '#223', '#323', '#334'];
+    // the stranger's own small table
+    layer(S, T => {
+      T.rect(ct.x0, ct.y, ct.x1 - ct.x0, 2, '#532'); T.rect(ct.x0, ct.y, ct.x1 - ct.x0, 1, '#643');
+      T.rect(ct.x0, ct.y + 2, ct.x1 - ct.x0, 3, '#210'); T.rect(ct.x0 + 2, ct.y + 5, 2, L.yF + 4 - ct.y - 5, '#100');
+    });
+    layer(S, T => {
+      // cloak: broad shoulders falling to the bench
+      T.poly([[x - 4, y + 9], [x + 6, y + 9], [x + 14, y + 20], [x + 16, ct.y + 2], [x - 15, ct.y + 2], [x - 12, y + 19]], CLOAK, { grad: [x - 14, y + 10, x + 14, ct.y, 0.55, 0.2] });
+      // fold lines
+      T.line(x - 6, y + 16, x - 9, ct.y, '#000'); T.line(x + 4, y + 15, x + 7, ct.y, '#000'); T.line(x - 1, y + 17, x - 1, ct.y, '#101');
+      // hood: a deep cowl, peak tipped back
+      T.poly([[x + 1, y], [x + 6, y + 4], [x + 8, y + 11], [x + 5, y + 16], [x - 7, y + 16], [x - 9, y + 10], [x - 6, y + 3]], CLOAK, { grad: [x - 8, y, x + 8, y + 16, 0.7, 0.25] });
+      // the dark of the hood's opening
+      T.poly([[x - 6, y + 7], [x + 1, y + 5], [x + 3, y + 10], [x + 1, y + 15], [x - 6, y + 15], [x - 7.5, y + 11]], ['#000'], { tone: 0 });
+      // two faint eyes in the dark
+      T.px(x - 4, y + 10, '#764'); T.px(x - 1, y + 10, '#764');
+      // sleeve and gloved hand reaching for the tankard
+      T.capsule(x - 9, y + 20, x - 14, ct.y - 2, 2.6, 2.2, CLOAK, { hi: 5 });
+      T.ball(x - 15, ct.y - 2, 1.8, 1.5, ['#100', '#211', '#322', '#432']);
+      // pipe: stem from the hood's shadow, bowl glowing
+      T.line(x - 3, y + 14, L.pipe.x + 1, L.pipe.y - 1, '#321');
+      T.rect(L.pipe.x - 1, L.pipe.y - 2, 3, 3, '#321'); T.rect(L.pipe.x - 1, L.pipe.y - 2, 3, 1, '#a41');
+      // tankard on the corner table
+      // firelight rims the cloak's left edges (the side facing the hearth), from the layer's own mask
+      const src = T.data.slice(), W2 = T.w, black = P.toInt('#000');
+      for (let yy = y; yy < ct.y; yy++) for (let xx = x - 17; xx < x + 8; xx++) {
+        const v = src[yy * W2 + xx];
+        if (!v || v === black || src[yy * W2 + xx - 1]) continue;
+        T.set(xx, yy, yy < y + 16 ? '#643' : '#421');
+        const n = src[yy * W2 + xx + 1];
+        if (yy < y + 14 && n && n !== black) T.set(xx + 1, yy, '#322');
+      }
+      T.capsule(ct.x0 + 7, ct.y - 6, ct.x0 + 7, ct.y - 1, 2.3, 2.3, R_PEWTER, { hi: 5 });
+      T.horn(ct.x0 + 9, ct.y - 5, ct.x0 + 12, ct.y - 4, ct.x0 + 9, ct.y - 2, 0.6, 0.6, R_PEWTER, { hi: 4 });
+    }, { light: [-0.9, -0.1, 0.4], ambient: 0.05 });
+  }
+
+  function innAnim(ctx, ox, oy, w, h, t) {
+    const L = innLayout(w, h), F2 = L.fp;
+    const f = Math.floor(t * 11) % NF;
+    const fw = F2.ox1 - F2.ox0 - 4, fh = L.yF - F2.oTop - 2;
+    const fire = K.cached(`dw27|infire|${fw}|${fh}|${f}`, fw, fh, S => {
+      paintFire(S, [
+        { cx: fw * 0.5, base: fh - 4, h: fh * 0.92, hw: 6, sway: 1.8, ph: 0 },
+        { cx: fw * 0.3, base: fh - 4, h: fh * 0.62, hw: 4.5, sway: 1.5, ph: 2.2 },
+        { cx: fw * 0.7, base: fh - 3, h: fh * 0.72, hw: 4.5, sway: 1.6, ph: 4.1 },
+        { cx: fw * 0.15, base: fh - 3, h: fh * 0.35, hw: 3, sway: 1, ph: 1.1 },
+        { cx: fw * 0.86, base: fh - 3, h: fh * 0.4, hw: 3, sway: 1, ph: 5.3 },
+      ], f, { lo: 2 });
+    });
+    G.blit(fire, ox + F2.ox0 + 2, oy + F2.oTop + 1, { ctx });
+    // the front log sits over the flames' roots
+    G.blit(K.cached('dw27|inlog3', 36, 11, S => {
+      const BARK = ['#100', '#210', '#310', '#421', '#532', '#643'];
+      const lg = { light: K.norm3([-0.4, -0.8, 0.45]) };
+      for (let x = 4; x < 32; x++) for (let y = 7; y < 11; y++) S.set(x, y, FIRE[(hash2(x, y, 8) * 4 | 0) + (y < 9 ? 1 : 0)]);   // coal bed
+      S.capsule(3, 8, 20, 4, 2.4, 2.2, BARK, lg);
+      S.capsule(15, 4, 32, 8, 2.4, 2.4, BARK, lg);
+      // bark furrows and the fire licking the top edges
+      for (let x = 2; x < 34; x += 3) for (let y = 2; y < 11; y++) if (S.opaque(x, y) && hash2(x, y, 3) > 0.5) S.set(x, y, '#210');
+      S.recolor((x, y) => !S.opaque(x, y - 1) && x > 4 && x < 31, (hx, x) => (x % 3 === 0 ? '#fa2' : '#c40'));
+      // glowing cut ends
+      S.ellipse(2, 8, 1.4, 2, '#a41'); S.px(2, 8, '#fa2');
+      S.ellipse(33, 8, 1.4, 2.2, '#c52'); S.px(33, 8, '#fd5');
+      S.outline('#100');
+    }), ox + L.fire.x - 18, oy + L.yF - 10, { ctx });
+    const sp = remember(`inSp|${w}x${h}`, () => {
+      const r = U.rng(9), out = [];
+      for (let i = 0; i < 8; i++) out.push({ x: L.fire.x - 12 + r() * 24, y: L.yF - 8, rise: 10 + r() * 14, rate: 0.4 + r() * 0.6, ph: r(), wob: 3, amp: 1, dx: (r() - 0.5) * 6 });
+      return out;
+    });
+    drawEmbers(ctx, sp, t, ox, oy);
+    // candles
+    L.candles.forEach((c, i) => G.blit(candleFlame((Math.floor(t * 8) + i * 3) % 4), ox + c.x - 2, oy + c.y - 5, { ctx }));
+    // the stranger draws on the pipe: the ember swells, then a slow curl of smoke
+    const cyc = (t % 6) / 6;
+    const draw = cyc < 0.12 ? cyc / 0.12 : cyc < 0.3 ? 1 - (cyc - 0.12) / 0.18 : 0;
+    const p = L.pipe;
+    G.rect(ox + p.x - 1, oy + p.y - 2, 3, 1, draw > 0.5 ? '#fd5' : draw > 0.1 ? '#e70' : '#a41', ctx);
+    if (draw > 0.3) G.blit(haloSprite(4, draw * 0.5, '#c40'), ox + p.x - 4, oy + p.y - 6, { ctx });
+    for (let i = 0; i < 4; i++) {
+      const life = ((t * 0.15 + i / 4) % 1);
+      const sx = p.x - 2 - life * 10 + Math.sin(t * 0.8 + i * 1.7 + life * 5) * (0.5 + life * 2);
+      const sy = p.y - 4 - life * 18;
+      if (life > 0.85) continue;
+      const r = life < 0.45 ? 1 : 2;
+      G.blit(K.cached(`dw27|smoke|${r}|${life < 0.5 ? 0 : 1}`, r * 2 + 1, r * 2 + 1, S => {
+        const c = life < 0.5 ? ['#323', '#545'] : ['#212', '#323'];
+        if (r === 1) { S.rect(0, 1, 3, 1, c[0]); S.rect(1, 0, 1, 3, c[0]); S.px(1, 1, c[1]); return; }
+        S.rect(1, 0, 3, 5, c[0]); S.rect(0, 1, 5, 3, c[0]); S.rect(1, 1, 2, 2, c[1]);
+      }), ox + Math.round(sx) - r, oy + Math.round(sy) - r, { ctx });
+    }
+    // now and then, the eyes catch the light
+    const blink = (t % 7.3) < 0.18 ? 0 : 1;
+    const glint = (t % 7.3) > 3 && (t % 7.3) < 3.6;
+    const ex = L.fig.x - 4, ey = L.fig.y + 10;
+    G.rect(ox + ex, oy + ey, 1, 1, blink ? (glint ? '#ec8' : '#764') : '#000', ctx);
+    G.rect(ox + ex + 3, oy + ey, 1, 1, blink ? (glint ? '#ec8' : '#764') : '#000', ctx);
+  }
+
+  A.scenes['inn'] = { paint: paintInn, animate: innAnim };
 
 })();
