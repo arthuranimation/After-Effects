@@ -503,7 +503,7 @@
           const pw = 1 + k * k * W * 0.16;
           for (let x = Math.floor(pc - pw); x <= pc + pw; x++) {
             const e = 1 - Math.abs(x + 0.5 - pc) / pw;
-            if (e * (0.55 - k * 0.25) > TH(x, y) && S.opaque(x, y)) S.set(x, y, '#101');
+            if (e * (0.42 - k * 0.2) > TH(x, y) && S.opaque(x, y)) S.set(x, y, '#102');
           }
         }
       }
@@ -615,7 +615,8 @@
       const iw = Math.min(86, Math.round(w * 0.36));
       L.inn = { x0: w - iw, x1: w, base: L.yF + 2, top: L.yF + 2 - 100 };
       L.braziers = [[cx - 26, L.yB + 15], [cx + 26, L.yB + 15]];
-      L.moon = { x: Math.round(w * 0.2), y: Math.max(14, Math.round((L.arena.top) * 0.3)), r: 10 };
+      const mr = Math.round(U.clamp(L.arena.top * 0.05, 9, 13));
+      L.moon = { x: Math.round(w * 0.2), y: Math.max(mr + 4, Math.round((L.arena.top) * 0.3)), r: mr };
       L.stars = makeStars(w, L.wallTop - 4, Math.round(w * (L.wallTop) / 260), 777,
         (x, y) => Math.hypot(x - L.moon.x, y - L.moon.y) < L.moon.r * 2);
       return L;
@@ -679,8 +680,20 @@
   function inked(S, w, h, fn, ink = '#101') {
     const C = K.create(w, h);
     fn(C);
-    C.outline(ink);
-    S.stamp(C, 0, 0);
+    const d = C.data;
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) if (d[row + x]) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y0 > y) y0 = y; y1 = y; }
+    }
+    if (x1 < 0) return C;
+    x0 = Math.max(0, x0 - 1); y0 = Math.max(0, y0 - 1); x1 = Math.min(w - 1, x1 + 1); y1 = Math.min(h - 1, y1 + 1);
+    const ci = P.toInt(ink);
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const i = y * w + x;
+      if (d[i]) { S.data[i] = d[i]; continue; }
+      if ((x > 0 && d[i - 1]) || (x < w - 1 && d[i + 1]) || (y > 0 && d[i - w]) || (y < h - 1 && d[i + w])) S.data[i] = ci;
+    }
     return C;
   }
 
@@ -738,7 +751,7 @@
         const hex = S.getHex(x, y);
         if (!hex) continue;
         const d = Math.hypot((x - gx) / 70, (y - gy) / 50);
-        const f = (1 - d) * 0.9;
+        const f = Math.pow(Math.max(0, 1 - d), 1.6) * 1.2;
         if (f > TH(x, y)) S.set(x, y, P.mix(hex, '#f84', 0.32));
         if (f > TH(x, y) + 0.45) S.set(x, y, P.mix(hex, '#fb6', 0.45));
       }
@@ -1339,7 +1352,6 @@
       // torch light on the stone around every sconce
       for (const [tx, ty] of L.torches) lightPool(S, tx, ty, 14, 0.9, '#f93');
       L.stars = L.stars.filter(st => (st.y < L.wallTop - 14) && !(st.x >= L.arena.x0 && st.x < L.arena.x1 && st.y > L.arena.top) && !(st.x >= L.apo.x0 - 3 && st.x < L.apo.x1 + 3 && st.y > L.apo.top - 4) && !(st.x >= L.gate.x0 && st.x < L.gate.x1 && st.y > L.gate.top - 6));
-      L.painted = (L.painted || 0) + 1;
     },
     animate(ctx, x, y, w, h, t, state) {
       const L = townLayout(w, h);
@@ -1449,7 +1461,7 @@
         { id: 'gate', x: g.x0, y: g.top - 4, w: g.x1 - g.x0, h: g.base + 8 - (g.top - 4), label: 'NORTH GATE' },
         { id: 'apothecary', x: a.x0 - 8, y: a.top, w: a.x1 - a.x0 + 8, h: n.top - 5 - a.top, label: 'APOTHECARY' },
         { id: 'smithy', x: sm.x0, y: sm.top, w: sm.x1 - sm.x0, h: Math.min(h, sm.base + 8) - sm.top, label: 'SMITHY' },
-        { id: 'inn', x: n.x0 - 16, y: n.top + 1, w: n.x1 - n.x0 + 16, h: Math.min(h, n.base + 6) - n.top - 1, label: 'INN' },
+        { id: 'inn', x: n.x0 - 16, y: g.base + 9, w: n.x1 - n.x0 + 16, h: Math.min(h, n.base + 6) - (g.base + 9), label: 'INN' },
       ];
     },
   };
@@ -1561,6 +1573,7 @@
       L.sun = [L.cx + 2, L.yH];
       L.soffit = 5;
       L.heroH = Math.round(L.OH * 0.46);
+      L.torches = [[L.ax0 - 6, L.spring + 14], [L.ax1 + 5, L.spring + 14]];
       // pixel rows of the visible opening (inside the soffit) for exact clipping
       L.rows = [];
       for (let y = L.archTop + L.soffit; y < L.yT; y++) {
@@ -1749,7 +1762,6 @@
     rimLight(C, '#435', null, (x, y) => !L.inArch(x, y));
     S.stamp(C, 0, 0);
     // torches either side of the arch (flames animate)
-    L.torches = [[ax0 - 6, L.spring + 14], [ax1 + 5, L.spring + 14]];
     for (const [tx, ty] of L.torches) { S.rect(tx - 1, ty + 1, 3, 1, '#112'); S.set(tx, ty + 2, '#001'); S.set(tx, ty, '#310'); lightPool(S, tx, ty, 12, 0.6, '#f93'); }
   }
 
@@ -1796,7 +1808,6 @@
         const half = top / 2 * (1 + k * 0.42);
         const fade = Math.pow(Math.max(0, 1 - k * 1.25), 1.6) * 1.05;
         const shHalf = hw * (1 + k * 1.3), shX = hx + k * 3;
-        const shLen = k < 0.62 || (k < 0.74 && Math.abs(0) < 1);
         for (let x = 0; x < w; x++) {
           const e = (half - Math.abs(x + 0.5 - L.cx)) / 5;
           if (e <= 0) continue;
@@ -1904,21 +1915,6 @@
     });
   }
 
-  // The hero's long shadow thrown toward us.
-  function vicShadow(w, h, L) {
-    return K.cached(`dw26|vic|shadow|${w}x${h}`, w, h - L.yT, S => {
-      const hw = L.heroH * 0.2, len = h - L.yT;
-      for (let y = 0; y < len; y++) {
-        const k = y / len, half = hw * (1 + k * 1.6), xc = L.cx - 1 + k * 4;
-        const shoulders = k > 0.55 && k < 0.8 ? 1.25 : 1;
-        for (let x = Math.floor(xc - half * shoulders); x <= xc + half * shoulders; x++) {
-          if (k > 0.86 && Math.hypot((x - xc) / (half * 0.7), (k - 0.9) / 0.06) > 1) continue;
-          if (0.85 - k * 0.3 > TH(x, y)) S.set(x, y, '#102');
-        }
-      }
-    });
-  }
-
   // The great portcullis (taller than the opening; slides up).
   function vicPortcullis(w, h, L) {
     const W = L.AW, H = L.OH + 10;
@@ -1998,8 +1994,8 @@
       ctx.restore();
       // sun rays shimmer in the sky; light floods the cobbles as the gate opens
       G.blit(vicRayLayer(w, h, 2 + Math.round(1 + Math.sin(t * 0.9))), x, y, { ctx });
-      const lv = Math.round(open * 6);
-      if (lv > 0) G.blit(vicFloorLayer(w, h, lv), x, y + L.yT, { ctx });
+      const lv = Math.max(1, Math.round(open * 6));      // a little light slips through the bars even while shut
+      G.blit(vicFloorLayer(w, h, lv), x, y + L.yT, { ctx });
       // torches burning down in the dawn
       for (let i = 0; i < L.torches.length; i++) {
         const [tx, ty] = L.torches[i];
@@ -2204,9 +2200,9 @@
     };
     berry(d1 + 15, 1); berry(bx(3) + 17, 0); berry(d2 - 15, 2); berry(bx(5) + 11, 52);
     // a four-point glint on the top-left bevel of the K
-    const gx = bx(3) + 1, gy = bt(3) + 1;
-    for (let i = 1; i <= 3; i++) {
-      const c = i === 1 ? '#fff' : i === 2 ? '#ffb' : '#fe6';
+    const gx = bx(3), gy = bt(3);
+    for (let i = 1; i <= 4; i++) {
+      const c = i === 1 ? '#fff' : i === 2 ? '#ffe' : i === 3 ? '#fe6' : '#c92';
       S.set(gx - i, gy, c); S.set(gx + i, gy, c); S.set(gx, gy - i, c); S.set(gx, gy + i, c);
     }
     S.set(gx, gy, '#fff');

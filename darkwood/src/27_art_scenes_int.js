@@ -1057,4 +1057,358 @@
     paint: paintArena,
     animate: arenaAnim,
   };
+
+  // ================================================================
+  // SHOP INTERIORS — shared pieces
+  // ================================================================
+  // Hue-shifted ramps: cool blue-violet shadows climbing to warm highlights,
+  // so every prop sits in "firelight against the night" without extra work.
+  const R_STEEL = ['#001', '#112', '#223', '#334', '#545', '#765', '#a86', '#dc9', '#ffd'];
+  const R_COLD = ['#001', '#012', '#123', '#234', '#346', '#568', '#89b', '#bce'];
+  const R_WOOD = ['#000', '#100', '#210', '#320', '#431', '#642', '#863', '#a75'];
+  const R_LEATH = ['#100', '#200', '#310', '#420', '#531', '#742', '#953'];
+  const R_SOOT = ['#000', '#101', '#111', '#212', '#322', '#432', '#643', '#854'];
+  const R_BRASS = ['#100', '#210', '#430', '#640', '#861', '#b82', '#da4', '#fd7'];
+
+  // Bayer-dithered pick along a single ramp, v in 0..1.
+  const rampPick = (ramp, v, x, y) => P.rampF(ramp, clamp(v, 0, 1), x, y);
+  function falloff(x, y, lx, ly, r, fy = 1) {
+    const dx = x + 0.5 - lx, dy = (y + 0.5 - ly) * fy;
+    const d = Math.sqrt(dx * dx + dy * dy) / r;
+    return d < 1 ? (1 - d) * (1 - d) : 0;
+  }
+  // A layer of props: painted with the kit, outlined, then stamped.
+  function layer(S, fn, o = {}) {
+    const T = K.create(S.w, S.h);
+    if (o.light) T.light = K.norm3(o.light);
+    if (o.ambient !== undefined) T.ambient = o.ambient;
+    fn(T);
+    if (o.outline !== false) T.outline(o.ink || '#101');
+    S.stamp(T, 0, 0);
+    return T;
+  }
+  // Rough stone block courses in screen pixels (x joints per course).
+  const WALL_C = makeCourses(301, 24, 9, 20, 400);
+  function roughStone(x, y, ch, seed) {
+    const ci = Math.floor(y / ch), zc = y - ci * ch;
+    const B = findBlock(WALL_C[(ci + seed) % WALL_C.length], x - 200 + seed * 7);
+    if (zc === ch - 1 || B.ls < 1) return 0.12;
+    let b = 0.34 + hash2(B.i, ci + seed, 9) * 0.1;
+    if (zc === 0) b += 0.08;
+    else if (zc === ch - 2) b -= 0.06;
+    if (B.ls < 2) b += 0.05;
+    else if (B.ls >= B.bw - 1) b -= 0.06;
+    return b + (vnoise(x * 0.3, y * 0.3, seed) - 0.5) * 0.1;
+  }
+
+  // ================================================================
+  // SMITHY — a roaring forge, anvil, racks of blades, a moonlit window
+  // ================================================================
+  const SM_WALL = [
+    ['#000', '#001', '#011', '#012', '#112', '#123', '#223', '#234', '#345', '#456'],
+    ['#000', '#101', '#111', '#212', '#222', '#323', '#333', '#434', '#544', '#655'],
+    ['#100', '#200', '#311', '#321', '#432', '#542', '#653', '#764', '#975', '#a86'],
+    ['#100', '#310', '#420', '#530', '#641', '#752', '#a63', '#c84', '#ea6', '#fc8'],
+  ];
+
+  function smithLayout(w, h) {
+    return remember(`sm|${w}x${h}`, () => {
+      const L = { w, h };
+      L.yF = h - 22;
+      L.hx0 = 3; L.hx1 = 73;
+      L.hTop = L.yF - 19; L.hoodBot = L.hTop - 23; L.hoodTop = L.hoodBot - 12;
+      L.cx0 = 24; L.cx1 = 52;
+      L.fire = { x: (L.hx0 + L.hx1) / 2, y: L.hTop - 4 };
+      L.win = { x0: w - 64, x1: w - 44, y0: Math.max(8, L.yF - 68), y1: L.yF - 44 };
+      L.anv = { x: w - 60, y: L.yF - 25 };
+      L.bar = { x0: w - 27, x1: w - 5, y0: L.yF - 17 };
+      L.rack = { x0: 98, x1: w - 96, y0: L.yF - 64, y1: L.yF - 30 };
+      return L;
+    });
+  }
+
+  function paintSmithy(S, w, h) {
+    const L = smithLayout(w, h);
+    const fx = L.fire.x, fy = L.fire.y;
+    const W = L.win;
+    const fireAt = (x, y) => {
+      const dx = x + 0.5 - fx, dy = (y + 0.5 - fy) * 1.1;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      const a = Math.max(0, 1 - d / (w * 0.95));
+      return a * a * 1.1 + Math.max(0, 1 - d / 46) * 0.45;
+    };
+    // moonlight shaft from the window, falling down and to the left
+    const shaftAt = (x, y) => {
+      if (y < W.y1) return 0;
+      const xw = x + 0.5 + (y + 0.5 - W.y1) * 0.62;
+      if (xw < W.x0 + 2 || xw > W.x1 - 2) return 0;
+      const edge = Math.min(xw - W.x0 - 2, W.x1 - 2 - xw) / 4;
+      return clamp(edge, 0, 1) * Math.max(0, 1 - (y - W.y1) / (L.yF - W.y1 + 20));
+    };
+    const hoodHalf = y => {   // half-width of the hood at row y (trapezoid narrowing to the chimney)
+      const t = clamp((y - L.hoodTop) / (L.hoodBot - L.hoodTop), 0, 1);
+      return { l: L.cx0 + (L.hx0 - 2 - L.cx0) * t, r: L.cx1 + (L.hx1 + 2 - L.cx1) * t };
+    };
+
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const lf = fireAt(x, y);
+      // ---- chimney and hood (soot-black brick, lit from below) ----
+      if (y < L.hoodBot) {
+        const hb = y < L.hoodTop ? { l: L.cx0, r: L.cx1 } : hoodHalf(y);
+        if (x >= hb.l && x < hb.r) {
+          const lip = y >= L.hoodBot - 4;
+          const row = Math.floor(y / 4), off = (row & 1) * 4;
+          const mortar = (y % 4 === 3) || ((x + off) % 9 === 0);
+          let b = mortar ? 0.14 : 0.3 + hash2((x + off) / 9 | 0, row, 3) * 0.08;
+          if (x < hb.l + 1.5) b += 0.08;                     // lit left edge
+          if (x > hb.r - 2.5) b -= 0.1;
+          b += (vnoise(x * 0.2, y * 0.2, 7) - 0.5) * 0.1;
+          if (lip) { b = y === L.hoodBot - 4 ? 0.3 : 0.42 + (y - (L.hoodBot - 4)) * 0.12; }
+          const up = lip ? 1.2 : 0.55 * Math.max(0, 1 - (L.hoodBot - y) / 30);
+          S.set(x, y, pick(SM_WALL, b * (0.3 + lf * 0.6 + up), 0.25 + lf * 0.7 + up * 0.4, x, y));
+          continue;
+        }
+      }
+      // ---- forge mouth: jambs, glowing firebrick, coals ----
+      if (y >= L.hoodBot && y < L.hTop && x >= L.hx0 && x < L.hx1) {
+        if (x < L.hx0 + 4 || x >= L.hx1 - 4) {
+          const left = x < L.hx0 + 4;
+          let b = (y % 6 === 5) ? 0.15 : 0.38;
+          b += left ? (x === L.hx0 ? 0.1 : x === L.hx0 + 3 ? 0.18 : 0) : (x === L.hx1 - 4 ? 0.22 : x === L.hx1 - 1 ? -0.1 : 0);
+          S.set(x, y, pick(SM_WALL, b * (0.4 + lf * 0.9), 0.4 + lf, x, y));
+          continue;
+        }
+        const t = (y - L.hoodBot) / (L.hTop - L.hoodBot);     // 0 top → 1 at the coals
+        const row = Math.floor(y / 3), off = (row & 1) * 3;
+        const mortar = (y % 3 === 2) || ((x + off) % 6 === 0);
+        let b = (mortar ? 0.35 : 0.55) * (0.35 + t * 0.85);
+        S.set(x, y, pick(SM_WALL, b, 0.7 + t * 0.3, x, y));
+        continue;
+      }
+      // ---- hearth: brick front, stone slab top ----
+      if (y >= L.hTop && y < L.yF && x >= L.hx0 - 1 && x < L.hx1 + 1) {
+        if (y < L.hTop + 3) {
+          let b = y === L.hTop ? 0.62 : y === L.hTop + 1 ? 0.48 : 0.22;
+          if (x === L.hx0 - 1) b += 0.1;
+          S.set(x, y, pick(SM_WALL, b * (0.6 + lf * 0.6), 0.55 + lf * 0.5, x, y));
+          continue;
+        }
+        const row = Math.floor((y - L.hTop - 3) / 4), off = (row & 1) * 5;
+        const mortar = ((y - L.hTop - 3) % 4 === 3) || ((x + off) % 10 === 0);
+        let b = mortar ? 0.12 : 0.36 + hash2((x + off) / 10 | 0, row, 5) * 0.1;
+        if ((y - L.hTop - 3) % 4 === 0 && !mortar) b += 0.08;
+        b *= 1 - (y - L.hTop) / (L.yF - L.hTop) * 0.35;
+        if (x <= L.hx0) b += 0.06; if (x >= L.hx1 - 1) b -= 0.08;
+        S.set(x, y, P.rampF(R_SOOT, clamp(b * (0.5 + lf * 0.9), 0, 1), x, y) === '#000' ? '#000' : pick(SM_WALL, b * (0.45 + lf * 0.75), 0.45 + lf * 0.6, x, y));
+        continue;
+      }
+      // ---- ceiling beam ----
+      if (y < 6) {
+        let b = y === 5 ? 0.15 : y === 4 ? 0.42 : 0.3 + (y === 0 ? -0.1 : 0);
+        b += (vnoise(x * 0.15, y, 4) - 0.5) * 0.12;
+        if ((x + 7) % 41 === 0 && y === 2) b = 0.7;
+        S.set(x, y, rampPick(R_WOOD, b * (0.5 + lf * 0.9), x, y));
+        continue;
+      }
+      // ---- the window: stone frame, bars, deep blue night ----
+      if (x >= W.x0 - 2 && x < W.x1 + 2 && y >= W.y0 - 2 && y < W.y1 + 2) {
+        const r = (W.x1 - W.x0) / 2, cxw = (W.x0 + W.x1) / 2, ya = W.y0 + r;
+        const inArch = y >= ya || Math.hypot(x + 0.5 - cxw, y + 0.5 - ya) < r;
+        const inFrame = y >= ya - 2 || Math.hypot(x + 0.5 - cxw, y + 0.5 - ya) < r + 2;
+        if (inArch && x >= W.x0 && x < W.x1 && y < W.y1) {
+          const bar = (x - W.x0) % 5 === 2 || (y - W.y0) % 7 === 6;
+          if (bar) S.set(x, y, (x - W.x0) % 5 === 2 && x - W.x0 < 10 ? '#112' : '#101');
+          else {
+            const v = 0.3 + (1 - (y - W.y0) / (W.y1 - W.y0)) * 0.35 + (x - W.x0) / (W.x1 - W.x0) * 0.2;
+            S.set(x, y, rampPick(['#012', '#123', '#134', '#245', '#357'], v, x, y));
+            if (hash2(x, y, 33) > 0.96) S.set(x, y, '#68a');
+          }
+          continue;
+        }
+        if (inFrame) {
+          const sill = y >= W.y1;
+          let b = sill ? (y === W.y1 ? 0.6 : 0.3) : (x < cxw ? 0.4 : 0.26);
+          S.set(x, y, pick(SM_WALL, b * (0.5 + lf * 0.6) + 0.1, 0.15 + lf * 0.4, x, y));
+          continue;
+        }
+      }
+      // ---- floor: flagstones ----
+      const sh = shaftAt(x, y);
+      if (y >= L.yF) {
+        const yy = y - L.yF;
+        const rows = [0, 4, 9, 15, 22, 30, 40];
+        let ri = 0; while (ri < rows.length - 1 && yy >= rows[ri + 1]) ri++;
+        const rh = rows[ri + 1] - rows[ri], ry = yy - rows[ri];
+        const sw = 14 + ri * 5, off = hash2(ri, 1, 2) * sw;
+        const xi = Math.floor((x + off) / sw), lx = (x + off) - xi * sw;
+        let b = 0.3 + hash2(xi, ri, 6) * 0.1;
+        if (ry === rh - 1 || lx < 1) b = 0.1;
+        else if (ry === 0) b += 0.1;
+        b += (hash2(x, y, 8) - 0.5) * 0.06;
+        if (yy < 2) b *= 0.6;
+        S.set(x, y, pick(SM_WALL, b * (0.35 + lf * 1.1) + sh * 0.3, 0.12 + lf * 1.1 - sh * 0.6, x, y));
+        continue;
+      }
+      // ---- back wall: rough stone, soot above the forge ----
+      let b = roughStone(x, y, 7, 3);
+      const soot = Math.max(0, 1 - Math.hypot(x - (L.cx0 + L.cx1) / 2, (y - L.hoodTop) * 0.6) / 70);
+      b *= 1 - soot * 0.5;
+      S.set(x, y, pick(SM_WALL, b * (0.32 + lf * 1.0) + sh * 0.22, 0.12 + lf * 1.1 - sh * 0.7, x, y));
+    }
+
+    // ---- coal bed (static base; the flames dance above it) ----
+    for (let y = L.hTop - 5; y < L.hTop; y++) for (let x = L.hx0 + 5; x < L.hx1 - 5; x++) {
+      const k = (x - (L.hx0 + 5)) / (L.hx1 - L.hx0 - 10);
+      const top = L.hTop - 1 - Math.sin(k * Math.PI) * 4 - (vnoise(x * 0.5, 1, 8) - 0.5) * 2;
+      if (y + 0.5 < top) continue;
+      const n = vnoise(x * 0.7, y * 0.9, 12);
+      const hot = n > 0.55 ? 6 : n > 0.42 ? 4 : n > 0.3 ? 2 : 1;
+      S.set(x, y, FIRE[clamp(hot + (y > L.hTop - 2 ? 1 : 0) + (TH(x, y) > 0.7 ? -1 : 0), 1, 7)]);
+    }
+
+    // ---- racks of blades on the back wall ----
+    const RK = L.rack;
+    layer(S, T => {
+      const n = Math.max(3, Math.floor((RK.x1 - RK.x0 - 6) / 9));
+      const sp = (RK.x1 - RK.x0 - 6) / Math.max(1, n - 1);
+      const rnd = U.rng(77);
+      for (let i = 0; i < n; i++) {
+        const x = Math.round(RK.x0 + 3 + i * sp);
+        const kind = i % 4;
+        const top = RK.y0 + 2 + Math.floor(rnd() * 3), len = RK.y1 - top - 2 - (kind === 2 ? 4 : 0);
+        const lit = clamp(1.25 - (x - fx) / (w * 0.9), 0.35, 1);
+        const hi = Math.round(4 + lit * 4), bw = kind === 1 ? 1.7 : 1.2;
+        // blade (point down)
+        T.capsule(x, top + 6, x, top + len - 2, bw, bw * 0.75, R_STEEL, { hi, spec: 0.6, light: K.norm3([-0.8, -0.3, 0.5]) });
+        T.tri([x - bw, top + len - 2], [x + bw + 0.5, top + len - 2], [x + 0.25, top + len + 1.5], R_STEEL, { tone: 0.45, hi });
+        T.line(x, top + 7, x, top + len - 2, R_STEEL[Math.min(hi, 6)]);   // fuller glint
+        // guard, grip, pommel
+        const gc = kind === 3 ? R_BRASS : R_STEEL;
+        T.capsule(x - 3.2, top + 5, x + 3.2, top + 5, 0.9, 0.9, gc, { hi: hi - 1 });
+        T.capsule(x, top + 1.5, x, top + 4, 0.8, 0.8, R_LEATH, { hi: 5 });
+        T.ball(x, top + 1, 1.2, 1.2, kind === 0 ? R_BRASS : R_STEEL, { hi: hi - 1 });
+      }
+      // the rack itself: two rails on iron brackets
+      for (const ry of [RK.y0 + 6, RK.y1 - 6]) {
+        T.capsule(RK.x0 - 2, ry, RK.x1 + 2, ry, 1.4, 1.4, R_WOOD, { hi: 6, light: K.norm3([-0.6, -0.6, 0.5]) });
+      }
+    }, { light: [-0.8, -0.3, 0.5] });
+
+    // ---- axes and a shield hung on the wall right of the rack ----
+    layer(S, T => {
+      const ax = RK.x1 + 12, ay = RK.y0 + 4;
+      // crossed axes
+      for (const sd of [-1, 1]) {
+        T.capsule(ax - sd * 8, ay + 22, ax + sd * 6, ay, 1.1, 1.1, R_WOOD, { hi: 6 });
+        const hx = ax + sd * 6, hy = ay + 2;
+        T.poly([[hx, hy - 3], [hx + sd * 6, hy - 6], [hx + sd * 7.5, hy + 1], [hx + sd * 6, hy + 6], [hx, hy + 3]], R_STEEL, { grad: [hx - 3, hy - 5, hx + 6, hy + 6, 0.85, 0.35], hi: 7 });
+      }
+      // round shield behind them
+    }, { light: [-0.8, -0.3, 0.5] });
+
+    // ---- bellows feeding the forge ----
+    layer(S, T => {
+      const bx = L.hx1 - 1, by = L.hTop + 6;
+      // leather pleats between two boards (wedge pointing left into the hearth)
+      const pts = [[bx, by], [bx + 26, by - 7], [bx + 28, by + 7], [bx, by + 2]];
+      T.poly(pts, R_LEATH, { grad: [bx, by - 6, bx, by + 7, 0.85, 0.25] });
+      for (let i = 1; i < 6; i++) {
+        const xx = bx + 3 + i * 4;
+        T.line(xx, by - (xx - bx) * 0.26 + 1, xx + 1, by + 2 + (xx - bx) * 0.18 - 1, '#310');
+      }
+      T.capsule(bx, by - 0.5, bx + 27, by - 7.5, 1.3, 1.6, R_WOOD, { hi: 7 });    // top board
+      T.capsule(bx, by + 2, bx + 28, by + 7.5, 1.2, 1.5, R_WOOD, { hi: 5 });       // bottom board
+      T.capsule(bx - 5, by + 1, bx + 1, by + 1, 1.2, 1.5, R_STEEL, { hi: 7 });    // nozzle into the fire
+      T.capsule(bx + 26, by - 8, bx + 34, by - 15, 0.9, 0.9, R_WOOD, { hi: 6 });  // handle
+    }, { light: [-0.9, -0.2, 0.45] });
+
+    // ---- anvil on a stump, a hot blade and a hammer ----
+    layer(S, T => {
+      const ax = L.anv.x, ay = L.anv.y;
+      // stump
+      T.poly([[ax - 9, ay + 9], [ax + 9, ay + 9], [ax + 10, L.yF + 4], [ax - 10, L.yF + 4]], R_WOOD, { grad: [ax - 10, 0, ax + 10, 0, 0.75, 0.2] });
+      for (let i = -6; i <= 6; i += 4) T.line(ax + i, ay + 11, ax + i + (i > 0 ? 1 : 0), L.yF + 3, '#210');
+      T.ellipse(ax, ay + 9, 9, 1.6, '#531');
+      T.capsule(ax - 10, ay + 14, ax + 10, ay + 14, 0.8, 0.8, R_STEEL, { hi: 5 });
+      // anvil: feet, waist, body, horn
+      T.poly([[ax - 9, ay + 9], [ax - 6, ay + 6], [ax + 6, ay + 6], [ax + 9, ay + 9]], R_STEEL, { tone: 0.35, hi: 7 });
+      T.poly([[ax - 4, ay + 6], [ax - 5, ay + 3], [ax + 6, ay + 3], [ax + 4, ay + 6]], R_STEEL, { grad: [ax - 5, 0, ax + 6, 0, 0.7, 0.25], hi: 7 });
+      T.poly([[ax - 9, ay - 2], [ax + 12, ay - 2], [ax + 11, ay + 3], [ax - 7, ay + 3]], R_STEEL, { grad: [ax - 9, ay - 2, ax + 12, ay + 3, 0.85, 0.3], hi: 8 });
+      T.horn(ax - 9, ay - 1, ax - 15, ay - 0.5, ax - 20, ay - 2.5, 2.4, 0.6, R_STEEL, { hi: 8, spec: 0.6 });
+      T.rect(ax - 9, ay - 2, 21, 1, '#dc9');                     // the face catches the firelight
+      T.rect(ax + 4, ay - 2, 8, 1, '#a86');
+      // a blade fresh from the fire, glowing on the face
+      T.capsule(ax - 7, ay - 3.5, ax + 6, ay - 3, 0.9, 0.7, ['#300', '#610', '#920', '#c40', '#e70', '#fa2', '#fd5'], { tone: 0.75 });
+      T.rect(ax - 5, ay - 4, 8, 1, '#fd5');
+      // hammer resting on the heel
+      T.capsule(ax + 6, ay - 4, ax + 17, ay - 10, 0.9, 0.8, R_WOOD, { hi: 6 });
+      T.poly([[ax + 3, ay - 7], [ax + 9, ay - 7], [ax + 9, ay - 3], [ax + 3, ay - 3]], R_STEEL, { grad: [ax + 3, ay - 7, ax + 9, ay - 3, 0.8, 0.3], hi: 7 });
+    }, { light: [-0.85, -0.25, 0.5] });
+
+    // ---- quench barrel ----
+    layer(S, T => {
+      const { x0, x1, y0 } = L.bar, cx = (x0 + x1) / 2, rx = (x1 - x0) / 2;
+      T.poly([[x0, y0], [x1, y0], [x1 - 1, L.yF + 5], [x0 + 1, L.yF + 5]], R_WOOD, { grad: [x0, 0, x1, 0, 0.7, 0.2] });
+      for (let x = x0 + 3; x < x1 - 1; x += 4) T.line(x, y0 + 2, x, L.yF + 4, '#210');
+      for (const yy of [y0 + 4, y0 + 13]) T.capsule(x0, yy, x1, yy, 0.8, 0.8, R_STEEL, { hi: 5 });
+      T.ellipse(cx, y0, rx, 2, '#320');
+      T.ellipse(cx, y0 + 0.5, rx - 1.5, 1.2, '#123');
+      T.rect(Math.round(cx - 4), y0, 4, 1, '#469');
+    }, { light: [-0.7, -0.5, 0.5] });
+
+    // ---- tongs leaning on the hearth ----
+    layer(S, T => {
+      T.capsule(L.hx0 + 6, L.hTop + 1, L.hx0 + 10, L.yF + 2, 0.7, 0.7, R_STEEL, { hi: 6 });
+      T.capsule(L.hx0 + 8, L.hTop + 1, L.hx0 + 9, L.yF + 2, 0.7, 0.7, R_STEEL, { hi: 5 });
+    });
+
+    // ---- warm glow spilling out of the forge mouth over everything ----
+    for (let y = L.hoodBot - 6; y < L.yF + 6; y++) for (let x = 0; x < L.hx1 + 30; x++) {
+      const a = falloff(x, y, fx, fy + 2, 34, 1.3);
+      if (a * 0.55 > TH(x, y) + 0.12 && S.opaque(x, y)) {
+        const hx = S.getHex(x, y);
+        S.set(x, y, P.mix(hx, '#f92', 0.22));
+      }
+    }
+  }
+
+  function smithyAnim(ctx, ox, oy, w, h, t) {
+    const L = smithLayout(w, h);
+    const f = Math.floor(t * 12) % NF;
+    // forge flames — cached per frame
+    const fw = L.hx1 - L.hx0 - 10, fh = L.hTop - L.hoodBot - 1;
+    const img = K.cached(`dw27|smfire|${fw}|${fh}|${f}`, fw, fh, S => {
+      const tongues = [];
+      const n = 6;
+      for (let i = 0; i < n; i++) {
+        const k = (i + 0.5) / n;
+        tongues.push({ cx: k * fw, base: fh + 1, h: fh * (0.55 + 0.4 * Math.sin(k * Math.PI)) * (0.85 + 0.15 * ((i * 7) % 3)), hw: fw / n * 0.95, sway: 1.6, ph: i * 1.9 });
+      }
+      paintFire(S, tongues, f, { lo: 2, gain: 1.05 });
+    });
+    G.blit(img, ox + L.hx0 + 5, oy + L.hoodBot + 1, { ctx });
+    // pulsing glow of the hot blade on the anvil
+    const pulse = 0.5 + 0.5 * Math.sin(t * 2.2);
+    const ax = L.anv.x, ay = L.anv.y;
+    G.rect(ox + ax - 5, oy + ay - 4, 8, 1, pulse > 0.6 ? '#ffb' : '#fd5', ctx);
+    G.blit(haloSprite(6, 0.25 + pulse * 0.2, '#e70'), ox + ax - 7, oy + ay - 10, { ctx });
+    // sparks from the coals, popping up and arcing out
+    const sp = remember(`smSp|${w}x${h}`, () => {
+      const r = U.rng(5), out = [];
+      for (let i = 0; i < 16; i++) out.push({ x: L.hx0 + 8 + r() * (L.hx1 - L.hx0 - 16), y: L.hTop - 3, rise: 18 + r() * 26, rate: 0.5 + r() * 0.9, ph: r(), wob: 3 + r() * 4, amp: 0.8 + r() * 1.5, dx: (r() - 0.5) * 16 });
+      return out;
+    });
+    drawEmbers(ctx, sp, t, ox, oy);
+    // steam curling off the quench barrel
+    const b = L.bar;
+    for (let i = 0; i < 5; i++) {
+      const life = (t * 0.35 + i / 5) % 1;
+      const x = (b.x0 + b.x1) / 2 + Math.sin(t * 1.3 + i * 2) * 2 + life * 3;
+      const y = b.y0 - 1 - life * 16;
+      if (life < 0.85) G.rect(ox + (x | 0), oy + (y | 0), life < 0.4 ? 2 : 1, 1, life < 0.5 ? '#556' : '#334', ctx);
+    }
+  }
+
+  A.scenes['smithy'] = { paint: paintSmithy, animate: smithyAnim };
+
 })();
