@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Drive the real game in a phone-sized headless Chromium and take screenshots.
 //
-//   node tools/play.mjs --scenario tools/scenarios/tour.mjs --out /tmp/shots [--size 390x844] [--dpr 3] [--page dev.html]
+//   node tools/play.mjs --scenario tools/scenarios/tour.mjs --out /tmp/shots [--size 390x844] [--dpr 3] [--page index.html|dev.html]
 //
 // A scenario module exports `default async function (api)` where api has:
 //   shot(name)            screenshot of the page at device resolution
@@ -32,7 +32,7 @@ const [vw, vh] = (args.size || '390x844').split('x').map(Number);
 const dpr = parseFloat(args.dpr || '3');
 const out = path.resolve(args.out || 'shots');
 fs.mkdirSync(out, { recursive: true });
-const pageFile = path.join(root, args.page || 'dev.html');
+const pageFile = path.join(root, args.page || 'index.html');   // test the real single-file build by default
 const scenario = (await import(url.pathToFileURL(path.resolve(args.scenario)).href)).default;
 
 const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] });

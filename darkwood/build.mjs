@@ -23,8 +23,19 @@ const inline = files.map(f => {
   return `<script>\n// ---- ${f} ----\n${code}\n</script>`;
 }).join('\n');
 
-fs.writeFileSync(path.join(root, 'index.html'), template.replace('<!DOCTYPE html>', '<!DOCTYPE html>\n' + banner).replace('<!--SCRIPTS-->', inline));
-fs.writeFileSync(path.join(root, 'dev.html'), template.replace('<!--SCRIPTS-->', files.map(f => `<script src="src/${f}"></script>`).join('\n')));
+// Replacer functions, not strings: a replacement string treats "$'" "$&" etc.
+// as patterns, and the game code contains those characters (e.g. the '$' glyph).
+const devTags = files.map(f => `<script src="src/${f}"></script>`).join('\n');
+fs.writeFileSync(path.join(root, 'index.html'), template.replace('<!DOCTYPE html>', () => '<!DOCTYPE html>\n' + banner).replace('<!--SCRIPTS-->', () => inline));
+fs.writeFileSync(path.join(root, 'dev.html'), template.replace('<!--SCRIPTS-->', () => devTags));
+
+// Guard: the built page must contain every module verbatim.
+const built = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+for (const f of files) {
+  const code = fs.readFileSync(path.join(srcDir, f), 'utf8').replace(/<\/script/gi, '<\\/script');
+  if (!built.includes(code)) { console.error('BUILD CHECK FAILED: ' + f + ' was not inlined verbatim'); process.exit(1); }
+}
+if ((built.match(/<\/body>/g) || []).length !== 1) { console.error('BUILD CHECK FAILED: stray </body>'); process.exit(1); }
 
 const size = fs.statSync(path.join(root, 'index.html')).size;
 console.log(`built index.html (${(size / 1024).toFixed(0)} KB, ${files.length} modules) and dev.html`);
