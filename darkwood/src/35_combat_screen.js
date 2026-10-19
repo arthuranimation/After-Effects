@@ -557,7 +557,8 @@
     } else {
       for (const [n, cnt] of Object.entries(p.potions)) {
         const it = Gm.itemData(n);
-        opts.push({ id: n, label: `${n} ×${cnt}`, sub: it.type === 'mana' ? `+${it.value} MP` : it.value >= 999 ? 'Full HP' : `+${it.value} HP`, icon: A.icon(it.icon), ok: true, act: () => doAct('potion', n), theme: 'green' });
+        const full = it.type === 'mana' ? p.mp >= p.maxMp : p.hp >= p.maxHp;
+        opts.push({ id: n, label: `${n} ×${cnt}`, sub: full ? (it.type === 'mana' ? 'MP is full' : 'HP is full') : it.type === 'mana' ? `+${it.value} MP` : it.value >= 999 ? 'Full HP' : `+${it.value} HP`, icon: A.icon(it.icon), ok: !full, act: () => doAct('potion', n), theme: 'green' });
       }
       for (const [n, cnt] of Object.entries(p.wands)) {
         const it = Gm.itemData(n);

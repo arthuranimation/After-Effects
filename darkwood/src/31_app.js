@@ -167,7 +167,7 @@
           App.confirm('NEW GAME', 'Start over? Your current hero and all progress will be lost.', () => {
             App.closeModal();
             Gm.clearSave(); Gm.newGame(); App.save();
-            App.go('town');
+            App.go('town', { intro: true });
           }, 'START OVER');
         }
         if (UI.button('set-close', x + 10, y + h - 30, w - 20, 22, 'CLOSE', { theme: 'stone', key: 'Escape', sound: 'back' })) App.closeModal(this);
