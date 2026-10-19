@@ -47,6 +47,7 @@ await page.waitForTimeout(400);
 let shotNo = 0;
 const api = {
   errors,
+  page,
   async shot(name) {
     const file = path.join(out, `${String(++shotNo).padStart(2, '0')}-${name}.png`);
     await page.screenshot({ path: file });

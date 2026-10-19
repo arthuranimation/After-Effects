@@ -10,7 +10,7 @@
 
   G.TARGET_W = 240;   // preferred logical width
   G.MAX_W = 288;      // never wider than this (keeps a portrait column on desktop)
-  G.MIN_H = 400;      // layouts assume at least this much logical height
+  G.MIN_H = 360;      // layouts assume at least this much logical height
   G.w = 240; G.h = 480; G.scale = 1;
   G.canvas = null; G.ctx = null;
   G.sizeVersion = 0;  // bumps on resize so size-dependent caches can refresh
@@ -41,6 +41,10 @@
       availW = vv ? vv.width : window.innerWidth;
       availH = vv ? vv.height : window.innerHeight;
     }
+    // A phone held sideways gets a "turn upright" card instead of a tiny strip.
+    let coarse = false;
+    try { coarse = window.matchMedia('(pointer: coarse)').matches; } catch (_) { /* ignore */ }
+    G.rotateHint = coarse && availW > availH * 1.15;
     const cssH = Math.floor(availH);
     const cssW = Math.min(Math.floor(availW), Math.round(cssH * 0.66));
     const devW = Math.floor(cssW * dpr), devH = Math.floor(cssH * dpr);

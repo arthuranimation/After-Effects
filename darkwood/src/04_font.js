@@ -195,6 +195,15 @@
 
   F.charW = ch => (ch === ' ' ? SPACE_W : glyphOf(ch).w);
 
+  // Shorten plain text with "…" so it fits maxW pixels.
+  F.fit = (text, maxW) => {
+    text = String(text);
+    if (F.measure(text) <= maxW) return text;
+    let t = F.strip(text);
+    while (t.length > 1 && F.measure(t + '…') > maxW) t = t.slice(0, -1);
+    return t.trimEnd() + '…';
+  };
+
   F.measure = (text, scale = 1) => {
     const s = F.strip(text);
     let w = 0;

@@ -894,7 +894,7 @@
     wl5: { hx: -16, hy: -12, mo: 0.6, frill: 0.75, turn: -0.5, neck: 0.6 },
     // rears up on its hind legs, frill fully flared
     wh: { rear: 1, hy: 0, hk: 0.95, mo: 1, tongue: 1, frill: 1.05, eye: 2, tail: 1 },
-    wh5: { rear: 0.5, mo: 0.6, frill: 0.8 },
+    wh5: { rear: 0.18, hy: -4, mo: 0.6, frill: 0.95 },   // gathering to rear: stays planted
     // head swung out high to the screen-right
     wr: { hx: 30, hy: -26, hk: 1.05, mo: 1, tongue: 1, frill: 1, turn: 1, tail: -1, eye: 2, neck: 1 },
     wr5: { hx: 16, hy: -12, mo: 0.6, frill: 0.75, turn: 0.5, neck: 0.6 },

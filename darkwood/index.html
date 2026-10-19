@@ -238,7 +238,7 @@ var DW = window.DW = window.DW || {};
 
   G.TARGET_W = 240;   // preferred logical width
   G.MAX_W = 288;      // never wider than this (keeps a portrait column on desktop)
-  G.MIN_H = 400;      // layouts assume at least this much logical height
+  G.MIN_H = 360;      // layouts assume at least this much logical height
   G.w = 240; G.h = 480; G.scale = 1;
   G.canvas = null; G.ctx = null;
   G.sizeVersion = 0;  // bumps on resize so size-dependent caches can refresh
@@ -269,6 +269,10 @@ var DW = window.DW = window.DW || {};
       availW = vv ? vv.width : window.innerWidth;
       availH = vv ? vv.height : window.innerHeight;
     }
+    // A phone held sideways gets a "turn upright" card instead of a tiny strip.
+    let coarse = false;
+    try { coarse = window.matchMedia('(pointer: coarse)').matches; } catch (_) { /* ignore */ }
+    G.rotateHint = coarse && availW > availH * 1.15;
     const cssH = Math.floor(availH);
     const cssW = Math.min(Math.floor(availW), Math.round(cssH * 0.66));
     const devW = Math.floor(cssW * dpr), devH = Math.floor(cssH * dpr);
@@ -1007,6 +1011,15 @@ var DW = window.DW = window.DW || {};
 
   F.charW = ch => (ch === ' ' ? SPACE_W : glyphOf(ch).w);
 
+  // Shorten plain text with "…" so it fits maxW pixels.
+  F.fit = (text, maxW) => {
+    text = String(text);
+    if (F.measure(text) <= maxW) return text;
+    let t = F.strip(text);
+    while (t.length > 1 && F.measure(t + '…') > maxW) t = t.slice(0, -1);
+    return t.trimEnd() + '…';
+  };
+
   F.measure = (text, scale = 1) => {
     const s = F.strip(text);
     let w = 0;
@@ -1202,12 +1215,21 @@ var DW = window.DW = window.DW || {};
     });
     const up = e => {
       if (!p.down) return;
-      [p.x, p.y] = toLogical(e);
+      // Some in-app viewers cancel the pointer mid-tap and report (0,0); keep the
+      // last known position in that case so the tap still lands where it began.
+      if (e.type !== 'pointercancel' || e.clientX || e.clientY) [p.x, p.y] = toLogical(e);
       p.down = false; flagUp = true; upPos = [p.x, p.y];
     };
     canvas.addEventListener('pointerup', up);
     canvas.addEventListener('pointercancel', up);
+    window.addEventListener('pointerup', up);
     canvas.addEventListener('contextmenu', e => e.preventDefault());
+    // Stop the browser / host app treating touches as scroll or zoom gestures
+    // (which cancels the pointer before the tap completes).
+    const block = e => { if (e.cancelable) e.preventDefault(); };
+    canvas.addEventListener('touchstart', block, { passive: false });
+    canvas.addEventListener('touchmove', block, { passive: false });
+    canvas.addEventListener('touchend', block, { passive: false });
     window.addEventListener('keydown', e => {
       if (e.repeat) return;
       keysDown.add(e.key); keyQueue.add(e.key);
@@ -1278,7 +1300,7 @@ var DW = window.DW = window.DW || {};
     purple: { face: '#426', hi: '#b8e', mid: '#74a', lo: '#101', text: '#dbf', sub: '#b8e' },
     green:  { face: '#243', hi: '#9c7', mid: '#475', lo: '#010', text: '#ce9', sub: '#9c7' },
     blue:   { face: '#248', hi: '#8de', mid: '#37a', lo: '#002', text: '#eff', sub: '#8de' },
-    gold:   { face: '#a70', hi: '#ffb', mid: '#eb3', lo: '#320', text: '#210', sub: '#530' },
+    gold:   { face: '#a70', hi: '#ffb', mid: '#eb3', lo: '#320', text: '#210', sub: '#210' },
     steel:  { face: '#345', hi: '#bcd', mid: '#689', lo: '#101', text: '#eef', sub: '#bcd' },
     dark:   { face: '#223', hi: '#556', mid: '#334', lo: '#000', text: '#ddc', sub: '#889' },
   };
@@ -1424,8 +1446,10 @@ var DW = window.DW = window.DW || {};
     // content = [icon] + a column holding the label and (optionally) a sub-label
     let iconW = 0;
     if (o.icon) iconW = o.icon.width + (label || o.sub ? 4 : 0);
+    if (label) label = F.fit(label, w - iconW - 8);
+    const sub = o.sub ? F.fit(o.sub, w - iconW - 10) : '';
     const lw = label ? F.measure(label) : 0;
-    const sw = o.sub ? Math.min(F.measure(o.sub), w - iconW - 10) : 0;
+    const sw = sub ? F.measure(sub) : 0;
     const colW = Math.max(lw, sw);
     const contentH = 7 + (o.sub ? 10 : 0);
     let cx = o.align === 'left' ? x + 6 : x + Math.floor((w - iconW - colW) / 2);
@@ -1437,8 +1461,8 @@ var DW = window.DW = window.DW || {};
     }
     const center = o.align !== 'left';
     if (label) F.draw(label, cx + off + (center ? Math.floor((colW - lw) / 2) : 0), cy, textCol, { shadow });
-    if (o.sub) {
-      F.draw(o.sub, cx + off + (center ? Math.floor((colW - sw) / 2) : 0), cy + 10, o.disabled ? '#556' : T.sub, { shadow: '#000' });
+    if (sub) {
+      F.draw(sub, cx + off + (center ? Math.floor((colW - sw) / 2) : 0), cy + 10, o.disabled ? '#556' : T.sub, { shadow: '#000' });
     }
     if (clicked && o.sound !== false) sfx(o.sound || 'tap');
     return clicked;
@@ -1558,13 +1582,15 @@ var DW = window.DW = window.DW || {};
   };
   UI.drawToasts = (top = 30) => {
     const now = performance.now();
-    toasts.forEach((t, i) => {
+    let ty = top;
+    toasts.forEach(t => {
       const age = now - t.born;
       const lines = F.wrap(t.text, G.w - 40);
       const w = Math.min(G.w - 16, Math.max(...lines.map(l => F.measure(l))) + 14);
       const h = lines.length * 10 + 6;
       const x = Math.floor((G.w - w) / 2);
-      const y = top + i * (h + 3) - Math.max(0, 6 - age / 25) | 0;
+      const y = ty - Math.max(0, 6 - age / 25) | 0;
+      ty += h + 3;
       G.rect(x, y, w, h, '#000');
       G.rect(x + 1, y + 1, w - 2, h - 2, '#112');
       G.hline(x + 1, x + w - 2, y + 1, '#445');
@@ -3012,7 +3038,7 @@ var DW = window.DW = window.DW || {};
       ranks: ['Guaranteed escape', 'Escape, keep 25% of its gold', 'Escape, keep 50% of its gold', 'Escape, keep 75% of its gold', 'Escape with all its gold and half its XP'] },
     { id: 'rallying_cry',   name: 'Rallying Cry',   rank5Name: 'War Hymn',         mp: 6,  icon: 'ab_rallying_cry',
       desc: 'Find your second wind.',
-      ranks: ['Restore 15% HP', 'Restore 20% HP', 'Restore 25% HP, cure 1 ailment', 'Restore 30% HP, cure all ailments', 'Restore 35% HP, cure all, act sooner'] },
+      ranks: ['Restore 15% HP', 'Restore 20% HP', 'Restore 25% HP, cure exhaustion', 'Restore 30% HP, cure exhaustion', 'Restore 35% HP, cure exhaustion, act sooner'] },
     { id: 'speed_warrior',  name: 'Speed Warrior',  rank5Name: 'Blur',             mp: 6,  icon: 'ab_speed_warrior',
       desc: "Match the enemy's speed, plus a step.",
       ranks: ['3 turns', '4 turns', '4 turns, +10% damage', '5 turns, +10% damage', '5 turns, +15% damage, act at once'] },
@@ -3217,8 +3243,10 @@ var DW = window.DW = window.DW || {};
     return gained;
   };
 
-  // Abilities that can still be ranked up.
-  Gm.masteryOptions = () => Gm.learnedList().filter(id => Gm.rank(id) < 5);
+  // Skill ranks are capped by level (rank 2 at level 3, 3 at 6, 4 at 9, 5 at 12)
+  // so a rank-5 skill can't be rushed at level 5.
+  Gm.maxRank = () => Math.min(5, 1 + Math.floor(S.p.level / 3));
+  Gm.masteryOptions = () => Gm.learnedList().filter(id => Gm.rank(id) < Gm.maxRank());
 
   // choice: 'vitality' | 'arcane' | 'mastery' (with ability id). Restores HP and MP fully.
   Gm.chooseLevelReward = (choice, abilityId) => {
@@ -3232,7 +3260,7 @@ var DW = window.DW = window.DW || {};
     } else if (choice === 'arcane') {
       p.maxMp += Gm.ARCANE_GAIN;
       msg = `+${Gm.ARCANE_GAIN} max MP`;
-    } else if (choice === 'mastery' && abilityId && Gm.rank(abilityId) > 0 && Gm.rank(abilityId) < 5) {
+    } else if (choice === 'mastery' && abilityId && Gm.rank(abilityId) > 0 && Gm.rank(abilityId) < Gm.maxRank()) {
       p.learned[abilityId]++;
       msg = `${Gm.abilityName(abilityId)} (rank ${p.learned[abilityId]})`;
     } else {
@@ -3246,7 +3274,8 @@ var DW = window.DW = window.DW || {};
   // ---------------------------------------------------------------
   // Shops. All return { ok, msg }.
   // ---------------------------------------------------------------
-  Gm.weaponPrice = w => Math.max(0, w.cost - Gm.tradeIn(Gm.weaponData().cost));
+  // Price after trade-in. Negative = the shop pays you the difference (a trade-down).
+  Gm.weaponPrice = w => w.cost - Gm.tradeIn(Gm.weaponData().cost);
   Gm.buyWeapon = name => {
     const w = Gm.weaponData(name);
     if (!w || w.name === S.p.weapon) return { ok: false, msg: 'Already equipped.' };
@@ -3254,13 +3283,20 @@ var DW = window.DW = window.DW || {};
     if (S.p.gold < price) return { ok: false, msg: `You need ${U.fmt(price)} gold.` };
     S.p.gold -= price;
     S.p.weapon = w.name;
-    return { ok: true, msg: `Equipped the ${w.name}.` };
+    return { ok: true, msg: `Equipped the ${w.name}.` + (price < 0 ? ` (+${-price}g back)` : '') };
   };
 
   Gm.itemPrice = item => {
-    if (item.type === 'armor') return Math.max(0, item.cost - Gm.tradeIn(Gm.armorData() ? Gm.armorData().cost : 0));
-    if (item.type === 'ring') return Math.max(0, item.cost - Gm.tradeIn(Gm.ringData() ? Gm.ringData().cost : 0));
+    if (item.type === 'armor') return item.cost - Gm.tradeIn(Gm.armorData() ? Gm.armorData().cost : 0);
+    if (item.type === 'ring') return item.cost - Gm.tradeIn(Gm.ringData() ? Gm.ringData().cost : 0);
     return item.cost;
+  };
+  // True when buying this would replace better gear you already wear.
+  Gm.isDowngrade = item => {
+    if (item.type === 'armor' && Gm.armorData()) return item.value < Gm.armorData().value;
+    if (item.type === 'ring' && Gm.ringData()) return item.value < Gm.ringData().value;
+    if (item.damage_max !== undefined) return item.cost < Gm.weaponData().cost;
+    return false;
   };
 
   Gm.itemStatus = item => {
@@ -3362,7 +3398,14 @@ var DW = window.DW = window.DW || {};
   // ---------------------------------------------------------------
   // Save / load (localStorage). Old v1/v2 saves from Darkwood 8 migrate.
   // ---------------------------------------------------------------
+  Gm.SETTINGS_KEY = 'darkwood_settings';
+  Gm.saveSettings = () => { try { localStorage.setItem(Gm.SETTINGS_KEY, JSON.stringify(S.settings)); } catch (_) { /* ignore */ } };
+  Gm.loadSettings = () => {
+    try { Object.assign(S.settings, JSON.parse(localStorage.getItem(Gm.SETTINGS_KEY) || '{}') || {}); } catch (_) { /* ignore */ }
+  };
+
   Gm.save = () => {
+    Gm.saveSettings();
     if (!S.p) return false;
     const data = { v: Gm.VERSION, player: S.p, quest: S.quest, flags: S.flags, settings: S.settings, stats: S.stats };
     try { localStorage.setItem(Gm.SAVE_KEY, JSON.stringify(data)); return true; } catch (_) { return false; }
@@ -3387,15 +3430,26 @@ var DW = window.DW = window.DW || {};
         const base = Gm.freshPlayer();
         const pd = data.player;
         S.p = Object.assign(base, pd);
-        S.p.potions = pd.potions || {}; S.p.wands = pd.wands || {}; S.p.tomes = pd.tomes || {};
-        S.p.learned = pd.learned || { double_slash: 1 };
-        S.p.slots = (pd.slots || []).filter(id => S.p.learned[id]).slice(0, D.SLOTS);
-        S.p.defeated = pd.defeated || {};
-        S.p.pendingLevels = pd.pendingLevels || [];
+        // keep only things the current data tables know about, so a renamed item
+        // or a damaged field can never break the game
+        const obj = v => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+        const counts = (v, ok) => Object.fromEntries(Object.entries(obj(v)).filter(([n, c]) => ok(n) && typeof c === 'number' && c > 0));
+        S.p.potions = counts(pd.potions, n => { const i = Gm.itemData(n); return i && (i.type === 'potion' || i.type === 'mana'); });
+        S.p.wands = counts(pd.wands, n => { const i = Gm.itemData(n); return i && i.type === 'wand'; });
+        S.p.tomes = obj(pd.tomes);
+        S.p.learned = counts(pd.learned, id => !!Gm.abilityData(id));
+        if (!Object.keys(S.p.learned).length) S.p.learned = { double_slash: 1 };
+        S.p.slots = (Array.isArray(pd.slots) ? pd.slots : []).filter(id => S.p.learned[id]).slice(0, D.SLOTS);
+        S.p.defeated = counts(pd.defeated, n => !!Gm.enemyData(n));
+        S.p.pendingLevels = (Array.isArray(pd.pendingLevels) ? pd.pendingLevels : []).filter(n => typeof n === 'number');
+        if (S.p.armor && !Gm.itemData(S.p.armor)) S.p.armor = null;
+        if (S.p.ring && !Gm.itemData(S.p.ring)) S.p.ring = null;
+        for (const k of ['level', 'xp', 'hp', 'maxHp', 'mp', 'maxMp', 'gold', 'str', 'dex', 'con']) if (typeof S.p[k] !== 'number' || !isFinite(S.p[k])) S.p[k] = Gm.freshPlayer()[k];
         if (!D.WEAPONS.find(w => w.name === S.p.weapon)) S.p.weapon = 'Dagger';
         S.quest = data.quest || null;
         S.flags = Object.assign({ gateOpen: false, victorySeen: false }, data.flags || {});
         S.settings = Object.assign({ assist: false }, data.settings || {});
+        Gm.loadSettings();   // settings changed on the title screen win
         S.stats = Object.assign({ fights: 0, wins: 0, losses: 0, blocks: 0, parries: 0, crits: 0, bestStreak: 0 }, data.stats || {});
       } else {
         Gm.migrate(data);
@@ -3415,8 +3469,12 @@ var DW = window.DW = window.DW || {};
     p.name = pd.name || 'Derek';
     p.level = Math.max(1, num(pd.level, 1));
     p.xp = Math.max(0, num(pd.xp, 0));
-    p.maxHp = Math.max(30, num(pd.maxHp, 30));
-    p.hp = U.clamp(num(pd.hp, p.maxHp), 1, p.maxHp);
+    // 8.0 heroes only gained HP from Vitality picks; v9 also grants HP every level.
+    const oldMax = Math.max(30, num(pd.maxHp, 30));
+    const vitPicks = Math.max(0, Math.round((oldMax - 30) / (10 + Math.max(0, Gm.bonus(num(pd.con, 10))))));
+    p.con = num(pd.con, 10);
+    p.maxHp = 30 + (p.level - 1) * Gm.hpPerLevel() + vitPicks * Gm.vitalityGain();
+    p.hp = Math.max(1, Math.round(p.maxHp * U.clamp(num(pd.hp, oldMax) / oldMax, 0, 1)));
     const oldMaxMp = num(pd.maxMp, 5);
     const arcanePicks = Math.max(0, Math.round((oldMaxMp - 5) / 2));
     p.maxMp = 10 + (p.level - 1) + arcanePicks * Gm.ARCANE_GAIN;
@@ -3438,6 +3496,8 @@ var DW = window.DW = window.DW || {};
     if (!p.slots.length) p.slots = Object.keys(p.learned).slice(0, D.SLOTS);
     if (data.quest && Gm.enemyData(data.quest.enemyName)) S.quest = { enemy: data.quest.enemyName, reward: num(data.quest.reward, 100), giver: 0 };
     if (p.defeated[D.FINAL_BOSS]) S.flags.gateOpen = true;
+    Gm.loadSettings();
+    Gm.save();
   };
 })();
 
@@ -3503,7 +3563,8 @@ var DW = window.DW = window.DW || {};
   C.enemySpeed = (c = S.combat) => {
     let spd = c.enemy.speed;
     const sl = st(c.est, 'slow'); if (sl) spd *= 1 - sl.pct;
-    const sh = st(c.est, 'shatter'); if (sh && sh.spdPct) spd *= 1 - sh.spdPct;
+    const sh = st(c.est, 'shatter');
+    if (sh && sh.spdPct) return Math.max(1, Math.min(Math.round(spd) - 1, Math.floor(spd * (1 - sh.spdPct))));
     return Math.max(1, Math.round(spd));
   };
 
@@ -3768,8 +3829,8 @@ var DW = window.DW = window.DW || {};
         ev(c, { t: 'counter' });
         if (rip.rank >= 4) addSt(c.est, { type: 'stun', turns: 1 });
         if (hurtEnemy(c, h.dmg, 'counter', h.crit)) { if (c.over) return {}; }
+        if (--rip.charges <= 0) dropSt(c.pst, 'riposte');
       }
-      if (--rip.charges <= 0) dropSt(c.pst, 'riposte');
     }
 
     if (!c.over && a.combo && !a.isCombo) {
@@ -3921,8 +3982,8 @@ var DW = window.DW = window.DW || {};
         const pct = [0.33, 0.4, 0.4, 0.45, 0.5][r - 1], turns = [3, 3, 4, 4, 5][r - 1];
         say(c, `${name}: ice shards hit for ${h.dmg}. Slowed ${Math.round(pct * 100)}%!`, 'ice');
         if (hurtEnemy(c, h.dmg, 'ice', h.crit)) break;
-        addSt(c.est, { type: 'slow', turns, pct, fresh: true });
-        if (r >= 4) addSt(c.est, { type: 'frost', turns, value: 2 + Math.floor(p.level / 2), fresh: true });
+        addSt(c.est, { type: 'slow', turns, pct });
+        if (r >= 4) addSt(c.est, { type: 'frost', turns, value: 2 + Math.floor(p.level / 2) });
         if (r >= 5) { addSt(c.est, { type: 'stun', turns: 1 }); say(c, `The ${c.enemy.name} is frozen solid!`, 'ice'); }
         break;
       }
@@ -3930,7 +3991,7 @@ var DW = window.DW = window.DW || {};
         const turns = [3, 4, 4, 5, 5][r - 1], bonus = [0, 0, 0.1, 0.1, 0.15][r - 1];
         addSt(c.pst, { type: 'surge', turns, bonus, fresh: true });
         say(c, `${name}: you move like the wind for ${turns} turns.`, 'blue');
-        if (r >= 5) c.pg = Math.max(c.pg, 100);
+        if (r >= 5) c.pg = Math.max(c.pg, c.eg + 1, 100);
         break;
       }
       case 'ultra_strength': {
@@ -9114,7 +9175,7 @@ var DW = window.DW = window.DW || {};
     wl5: { hx: -16, hy: -12, mo: 0.6, frill: 0.75, turn: -0.5, neck: 0.6 },
     // rears up on its hind legs, frill fully flared
     wh: { rear: 1, hy: 0, hk: 0.95, mo: 1, tongue: 1, frill: 1.05, eye: 2, tail: 1 },
-    wh5: { rear: 0.5, mo: 0.6, frill: 0.8 },
+    wh5: { rear: 0.18, hy: -4, mo: 0.6, frill: 0.95 },   // gathering to rear: stays planted
     // head swung out high to the screen-right
     wr: { hx: 30, hy: -26, hk: 1.05, mo: 1, tongue: 1, frill: 1, turn: 1, tail: -1, eye: 2, neck: 1 },
     wr5: { hx: 16, hy: -12, mo: 0.6, frill: 0.75, turn: 0.5, neck: 0.6 },
@@ -10684,8 +10745,9 @@ var DW = window.DW = window.DW || {};
     wl: { lean: -0.2, dx: -3, dy: -2, hx: -4, hy: 0, mo: 0.5, g: [42, 40], sa: 222, sl: 41, sw: 1, gap: 6, bL: 1, bR: -1, sb: 1, flare: 0.5 },
     wl5: { g: [44, 54], sa: 206, sl: 37, sb: 0, bL: 1, bR: -1, lean: -0.1 },
     // blade raised straight up over the crown, foreshortened as it tilts back
-    wh: { lean: 0, dx: 0, dy: -3, hx: 0, hy: 1, mo: 0.6, g: [60, 27], sa: 270, sl: 18, sw: 1.25, gap: 6, bL: -1, bR: 1, sb: 1, flare: -0.45, tilt: 0.4 },
-    wh5: { dy: 2, s: 0.99, g: [60, 36], sa: 270, sl: 28, sw: 1.15, gap: 6, bL: -1, bR: 1, sb: 1, flare: -0.25, mo: 0.4 },
+    // overhead: blade held level above the flaming hair (no headroom for it upright)
+    wh: { lean: 0, dx: 0, dy: -3, hx: 0, hy: 1, mo: 0.6, g: [40, 14], sa: 0, sl: 40, sw: 1.25, gap: 6, bL: -1, bR: 1, sb: 1, flare: -0.45, tilt: 0.4 },
+    wh5: { dy: 2, s: 0.99, g: [42, 24], sa: 0, sl: 36, sw: 1.15, gap: 6, bL: -1, bR: 1, sb: 1, flare: -0.25, mo: 0.4 },
     // blade cocked high over the screen-right shoulder
     wr: { lean: 0.2, dx: 3, dy: -2, hx: 4, hy: 0, mo: 0.5, g: [78, 40], sa: -42, sl: 41, sw: 1, gap: 6, bL: 1, bR: -1, sb: 1, flare: 0.5 },
     wr5: { g: [76, 54], sa: -26, sl: 37, sb: 0, bL: 1, bR: -1, lean: 0.1 },
@@ -18138,7 +18200,7 @@ var DW = window.DW = window.DW || {};
       F.big(title, G.w >> 1, ty + 2, { scale: 2, ramp: opts.ramp || 'gold', align: 'center' });
     }
     if (opts.back !== false) {
-      if (UI.button('hdr-back', 4, y + 4, 34, 18, '◀', { theme: 'stone', key: 'Escape', sound: 'back' })) App.go(opts.backTo || 'town');
+      if (UI.button('hdr-back', 4, y + 4, 38, 22, '◀', { theme: 'stone', key: 'Escape', sound: 'back' })) App.go(opts.backTo || 'town');
     }
     return y + h + 2;
   };
@@ -18278,7 +18340,7 @@ var DW = window.DW = window.DW || {};
           UI.toast('{blue}' + Gm.chooseLevelReward('arcane'), P.c.text); App.save(); sfx('magic');
         }
         cy += 34;
-        if (UI.button('lu-mas', x + 8, cy, bw, 30, 'MASTERY', { icon: A.icon('m_skills'), theme: 'purple', sub: opts.length ? 'Rank up a skill' : 'All skills mastered', disabled: !opts.length, key: '3' })) {
+        if (UI.button('lu-mas', x + 8, cy, bw, 30, 'MASTERY', { icon: A.icon('m_skills'), theme: 'purple', sub: opts.length ? 'Rank up a skill' : Gm.maxRank() < 5 ? `Next rank opens at level ${(Gm.maxRank()) * 3}` : 'All skills mastered', disabled: !opts.length, key: '3' })) {
           mastery = true;
         }
       },
@@ -18407,7 +18469,7 @@ var DW = window.DW = window.DW || {};
         }
         const label = hs.label || (place ? place.label : hs.id.toUpperCase());
         const lw = F.measure(label) + 6;
-        const lx = Math.round(hs.x + hs.w / 2 - lw / 2), ly = top + hs.y + hs.h - 12;
+        const lx = Math.round(hs.x + hs.w / 2 - lw / 2), ly = Math.max(top + 2, top + hs.y + (hs.id === 'gate' ? -6 : hs.h - 12));
         G.dither(lx, ly, lw, 10, null, '#000', pressed ? 14 : 10);
         F.draw(label, lx + 3, ly + 2, pressed ? '#fff' : hs.id === 'arena' ? '#fd5' : '#ddc', { shadow: true });
       }
@@ -18483,17 +18545,19 @@ var DW = window.DW = window.DW || {};
     return out;
   };
 
-  // Detail panel with title, wrapped text and an action button. Returns true when the button is tapped.
+  // Detail panel: title, description, a note line and an action button.
+  // The note wraps beside the button so the button never covers it.
   App.detail = (x, y, w, h, title, text, extra, btn) => {
     UI.panel(x, y, w, h, 'stone');
     F.draw(title, x + 8, y + 7, P.c.gold, { shadow: true });
-    const bw = btn ? 74 : 0;
-    const lines = F.wrap(text, w - 16 - (btn ? 0 : 0));
-    let cy = y + 19;
-    lines.slice(0, 3).forEach(ln => { F.draw(ln, x + 8, cy, P.c.text, { shadow: true }); cy += 10; });
-    if (extra) F.draw(extra, x + 8, y + h - 16, P.c.dim, { shadow: true });
+    const bw = btn ? 78 : 0;
+    const noteLines = extra ? F.wrap(extra, w - 20 - bw).slice(0, 2) : [];
+    const descRoom = Math.max(1, Math.floor((h - 20 - 6 - Math.max(noteLines.length * 10, btn ? 24 : 0)) / 10));
+    const lines = F.wrap(text, w - 16);
+    lines.slice(0, descRoom).forEach((ln, i) => F.draw(i === descRoom - 1 && lines.length > descRoom ? F.fit(ln + ' …', w - 16) : ln, x + 8, y + 19 + i * 10, P.c.text, { shadow: true }));
+    noteLines.forEach((ln, i) => F.draw(ln, x + 8, y + h - 6 - noteLines.length * 10 + i * 10, P.c.dim, { shadow: true }));
     if (!btn) return false;
-    return UI.button('detail-btn', x + w - bw - 6, y + h - 26, bw, 20, btn.label, { theme: btn.theme || 'gold', disabled: btn.disabled, sound: false, key: 'Enter' });
+    return UI.button('detail-btn', x + w - bw - 6, y + h - 28, bw, 22, btn.label, { theme: btn.theme || 'gold', disabled: btn.disabled, sound: false, key: 'Enter' });
   };
 
   const traitLabel = w => {
@@ -18527,7 +18591,7 @@ var DW = window.DW = window.DW || {};
     },
     draw() {
       const w = G.w, h = G.h;
-      const top = App.header('smithy', 'WEAPON SMITH', 96);
+      const top = App.header('smithy', 'WEAPON SMITH', h < 440 ? 70 : 96);
       const detH = 86;
       const b = Gm.damageBonus();
       const rows = D.WEAPONS.map(wp => {
@@ -18537,7 +18601,7 @@ var DW = window.DW = window.DW || {};
         return {
           icon: A.icon('w_' + wp.look), name: wp.name, nameCol: eq ? P.c.gold : undefined,
           line2: `${wp.damage_min + b}-${wp.damage_max + b} dmg  SPD ${sign(wp.speed)}  ${traitLabel(wp)}`,
-          right: eq ? '' : wp.cost === 0 ? 'free' : U.fmt(price) + 'g', rightCol: afford ? P.c.gold : P.c.redDim,
+          right: eq ? '' : price < 0 ? `+${U.fmt(-price)}g` : price === 0 ? 'free' : U.fmt(price) + 'g', rightCol: price < 0 ? P.c.green : afford ? P.c.gold : P.c.redDim,
           badge: eq ? 'EQUIPPED' : '', badgeCol: P.c.gold,
         };
       });
@@ -18550,9 +18614,9 @@ var DW = window.DW = window.DW || {};
         (Gm.tradeIn(cur.cost) ? `  · trade-in ${Gm.tradeIn(cur.cost)}g` : '');
       const price = Gm.weaponPrice(wp);
       if (App.detail(4, h - detH - 4, w - 8, detH, wp.name, wp.description, cmp,
-        { label: eq ? 'OWNED' : `BUY ${U.fmt(price)}`, disabled: eq, theme: S.p.gold >= price ? 'gold' : 'stone' })) {
+        { label: eq ? 'OWNED' : price < 0 ? 'SWAP' : `BUY ${U.fmt(price)}`, disabled: eq, theme: S.p.gold >= price ? 'gold' : 'stone' })) {
         if (wp.cost < cur.cost && S.p.gold >= price) {
-          App.confirm('TRADE DOWN?', `The smith will take your ${cur.name} in part exchange for the cheaper ${wp.name}. Are you sure?`, () => buyFx(Gm.buyWeapon(wp.name)), 'TRADE');
+          App.confirm('TRADE DOWN?', `The smith takes your ${cur.name} in part exchange for the cheaper ${wp.name}${price < 0 ? ` and pays you ${-price} gold` : ''}. Are you sure?`, () => buyFx(Gm.buyWeapon(wp.name)), 'TRADE');
         } else buyFx(Gm.buyWeapon(wp.name));
       }
       App.drawHud();
@@ -18584,9 +18648,16 @@ var DW = window.DW = window.DW || {};
     enter() { App.music('town'); aSel = 0; UI.scrollReset('alist'); },
     draw() {
       const w = G.w, h = G.h;
-      const top = App.header('apothecary', 'APOTHECARY', 96);
-      const nt = UI.tabs('atabs', 4, top + 2, w - 8, 20, TABS.map(t => t.label), aTab);
-      if (nt !== aTab) { aTab = nt; aSel = 0; UI.scrollReset('alist'); }
+      const top = App.header('apothecary', 'APOTHECARY', h < 440 ? 70 : 96);
+      const nt = UI.tabs('atabs', 4, top + 2, w - 8, 22, TABS.map(t => t.label), aTab);
+      if (nt !== aTab) {
+        aTab = nt; UI.scrollReset('alist');
+        // open on the first upgrade (or what you wear), never on a downgrade
+        const list = D.ITEMS.filter(i => TABS[aTab].types.includes(i.type));
+        const eq = list.findIndex(i => Gm.itemStatus(i) === 'equipped');
+        const up = list.findIndex(i => !Gm.itemStatus(i) && !Gm.isDowngrade(i));
+        aSel = Math.max(0, up >= 0 ? up : eq);
+      }
       const items = D.ITEMS.filter(i => TABS[aTab].types.includes(i.type));
       const detH = 86;
       const rows = items.map(it => {
@@ -18599,12 +18670,12 @@ var DW = window.DW = window.DW || {};
         else if (it.type === 'wand' && S.p.wands[it.name]) badge = `${S.p.wands[it.name]} charges`;
         return {
           icon: A.icon(it.icon), name: it.name, nameCol: st ? P.c.gold : undefined, line2: itemLine(it),
-          right: st ? '' : U.fmt(price) + 'g', rightCol: S.p.gold >= price ? P.c.gold : P.c.redDim,
+          right: st ? '' : price < 0 ? `+${U.fmt(-price)}g` : U.fmt(price) + 'g', rightCol: price < 0 ? P.c.green : S.p.gold >= price ? P.c.gold : P.c.redDim,
           badge, badgeCol: st ? P.c.gold : P.c.green, dim: st === 'read',
         };
       });
       aSel = Math.min(aSel, items.length - 1);
-      aSel = App.list('alist', rows, aSel, 4, top + 25, w - 8, h - top - 25 - detH - 8);
+      aSel = App.list('alist', rows, aSel, 4, top + 27, w - 8, h - top - 27 - detH - 8);
       const it = items[aSel];
       const st = Gm.itemStatus(it);
       const price = Gm.itemPrice(it);
@@ -18618,8 +18689,11 @@ var DW = window.DW = window.DW || {};
         extra = `Charges carried: ${S.p.wands[it.name] || 0}. Buying adds ${it.charges}.`;
       }
       if (App.detail(4, h - detH - 4, w - 8, detH, it.name, it.description, extra,
-        { label: st ? (st === 'read' ? 'STUDIED' : 'OWNED') : `BUY ${U.fmt(price)}`, disabled: !!st, theme: S.p.gold >= price ? 'gold' : 'stone' })) {
-        buyFx(Gm.buyItem(it.name));
+        { label: st ? (st === 'read' ? 'STUDIED' : 'OWNED') : price < 0 ? 'SWAP' : `BUY ${U.fmt(price)}`, disabled: !!st, theme: S.p.gold >= price ? 'gold' : 'stone' })) {
+        if (Gm.isDowngrade(it) && S.p.gold >= price) {
+          const cur = it.type === 'armor' ? Gm.armorData() : Gm.ringData();
+          App.confirm('TRADE DOWN?', `Swap your ${cur.name} for the weaker ${it.name}${price < 0 ? ` and get ${-price} gold back` : ''}?`, () => buyFx(Gm.buyItem(it.name)), 'SWAP');
+        } else buyFx(Gm.buyItem(it.name));
       }
       App.drawHud();
     },
@@ -18641,7 +18715,7 @@ var DW = window.DW = window.DW || {};
     enter() { App.music('town'); rumor = U.rand(0, D.RUMORS.length - 1); },
     draw() {
       const w = G.w, h = G.h, p = S.p;
-      const top = App.header('inn', 'THE RUSTY FLAGON', 96);
+      const top = App.header('inn', 'THE RUSTY FLAGON', h < 440 ? 70 : Math.min(150, h - 400 + 96));
       let y = top + 4;
       // rumour board
       const rumH = 64;
@@ -18731,19 +18805,20 @@ var DW = window.DW = window.DW || {};
     },
     draw() {
       const w = G.w, h = G.h;
-      let y = App.header('arena', '', 64, { state: { tier: tierSel }, live: { cheer: 0.2 } });
-      F.big('THE ARENA', w >> 1, App.HUD_H + 22, { scale: 2, ramp: 'gold', align: 'center' });
+      const short = h < 440;
+      let y = App.header('arena', '', short ? 40 : 64, { state: { tier: tierSel }, live: { cheer: 0.2 } });
+      F.big('THE ARENA', w >> 1, App.HUD_H + (short ? 12 : 22), { scale: 2, ramp: 'gold', align: 'center' });
 
       const locked = [1, 2, 3, 4].map(t => !Gm.tierUnlocked(t));
-      const nt = UI.tabs('tiers', 4, y + 2, w - 8, 20, D.TIERS.map(t => 'RING ' + t.short), tierSel - 1, { locked });
+      const nt = UI.tabs('tiers', 4, y + 2, w - 8, 22, D.TIERS.map(t => 'RING ' + t.short), tierSel - 1, { locked });
       if (nt !== tierSel - 1) { tierSel = nt + 1; eSel = 0; App.sfx('tap'); }
-      y += 25;
+      y += 27;
       const tier = D.TIERS[tierSel - 1];
       F.draw(tier.name, 8, y + 2, P.c.gold, { shadow: true });
       const done = Gm.defeatedIn(tierSel);
       F.draw(`${done}/5 beaten`, w - 8, y + 2, done >= D.TIER_UNLOCK ? P.c.green : P.c.dim, { align: 'right', shadow: true });
       y += 12;
-      y += F.drawWrapped(tier.blurb, 8, y, w - 16, P.c.dim) + 2;
+      if (!short) y += F.drawWrapped(tier.blurb, 8, y, w - 16, P.c.dim) + 2;
 
       // enemy rows
       const list = tierEnemies(tierSel);
@@ -18794,7 +18869,8 @@ var DW = window.DW = window.DW || {};
         F.draw(String(v), sx + 10, cy, P.c.text, { shadow: true });
         sx += 16 + F.measure(String(v)) + 6;
       }
-      F.draw(`${U.fmt(e.xp)} xp · ${U.fmt(e.gold)}g`, w - 10, cy, P.c.dim, { align: 'right' });
+      cy += 11;
+      F.draw(`Reward: {blue}${U.fmt(e.xp)} xp{/} · {gold}${U.fmt(e.gold)} gold`, 10, cy, P.c.dim);
       cy += 12;
       if (SPECIAL[e.special]) { F.draw(SPECIAL[e.special], 10, cy, P.c.text, { shadow: true }); cy += 11; }
       const moves = [];
@@ -18813,9 +18889,11 @@ var DW = window.DW = window.DW || {};
           A.drawScene('arena', bx, cy, bw, boxH, App.t, { tier: e.tier }, { cheer: 0.1 });
           const img = A.enemyFrame(e.name, { f: Math.floor(App.t * 4) });
           const d = A.enemyDef(e.name) || { w: img.width, h: img.height, anchor: [img.width >> 1, img.height - 1] };
-          const feet = cy + boxH - 8;
+          // tall foes are shown head-first (legs cropped) so the face is never cut off
+          const top = d.anchor[1] > boxH - 10 ? cy + 3 : cy + boxH - 8 - d.anchor[1];
+          const feet = top + d.anchor[1];
           G.dither((w >> 1) - Math.floor(d.w / 3), feet - 2, Math.floor(d.w * 2 / 3), 4, null, '#000', 9);
-          G.blit(img, (w >> 1) - d.anchor[0], feet - d.anchor[1]);
+          G.blit(img, (w >> 1) - d.anchor[0], top);
         });
       }
       if (UI.button('fight', 10, y + detH - 28, w - 20, 22, 'FIGHT!', { theme: 'red', key: 'Enter', sound: false })) {
@@ -18842,9 +18920,9 @@ var DW = window.DW = window.DW || {};
       const w = G.w, h = G.h, p = S.p;
       G.blit(G.cache(`herobg|${w}x${h}`, w, h - App.HUD_H, (cx, cw, ch) => G.copper(0, 0, cw, ch, ['#112', '#102', '#101'], cx, 6)), 0, App.HUD_H);
       let y = App.HUD_H + 4;
-      if (UI.button('hero-back', 4, y, 34, 20, '◀', { key: 'Escape', sound: 'back' })) App.go('town');
-      heroTab = UI.tabs('herotabs', 42, y, w - 46, 20, ['STATS', 'SKILLS', 'BESTIARY'], heroTab);
-      y += 26;
+      if (UI.button('hero-back', 4, y, 38, 22, '◀', { key: 'Escape', sound: 'back' })) App.go('town');
+      heroTab = UI.tabs('herotabs', 46, y, w - 50, 22, ['STATS', 'SKILLS', 'BESTIARY'], heroTab);
+      y += 28;
       if (heroTab === 0) drawStats(y);
       else if (heroTab === 1) drawSkills(y);
       else drawBestiary(y);
@@ -18882,7 +18960,7 @@ var DW = window.DW = window.DW || {};
     statRow(R, ly, colW - 4, null, 'Dexterity', p.dex); ly += 11;
     statRow(L, ly, colW - 4, null, 'Constitution', p.con);
     statRow(R, ly, colW - 4, null, 'Gold', U.fmt(p.gold), P.c.gold); ly += 11;
-    F.draw('STR: damage · DEX: speed, defense, crit · CON: health', w >> 1, ly + 1, '#667', { align: 'center' });
+    F.draw('STR dmg · DEX spd/def/crit · CON hp', w >> 1, ly + 1, '#889', { align: 'center' });
     y += 80;
 
     // gear & pack
@@ -18897,7 +18975,7 @@ var DW = window.DW = window.DW || {};
       F.draw(line, 30, gy + 9, P.c.dim);
       gy += 21;
     };
-    gearRow('w_' + wp.look, wp.name, `${wp.damage_min}-${wp.damage_max} dmg · SPD ${wp.speed >= 0 ? '+' : ''}${wp.speed}`);
+    gearRow('w_' + wp.look, wp.name, `${a0}-${a1} dmg · SPD ${wp.speed >= 0 ? '+' : ''}${wp.speed}`);
     const ar = Gm.armorData(), rg = Gm.ringData();
     gearRow(ar ? ar.icon : 'a_leather', ar ? ar.name : 'No armour', ar ? `+${ar.value} defense` : 'Buy some at the Apothecary');
     if (rg) gearRow(rg.icon, rg.name, `+${rg.value} defense`);
@@ -18907,7 +18985,10 @@ var DW = window.DW = window.DW || {};
     if (pack.length && gy + 20 < y + gearH) {
       F.draw('Pack:', 10, gy + 4, P.c.dim);
       let px = 40;
-      for (const [ic, c] of pack) { G.blit(A.icon(ic), px, gy + 1); F.draw('×' + c, px + 15, gy + 4, P.c.text); px += 34; }
+      for (const [ic, c] of pack) {
+        if (px + 30 > w - 6) { px = 40; gy += 17; }
+        G.blit(A.icon(ic), px, gy + 1); F.draw('×' + c, px + 15, gy + 4, P.c.text); px += 32;
+      }
       gy += 20;
     }
     if (S.quest && gy + 12 < y + gearH) F.draw(`Oath: slay the {red}${S.quest.enemy}{/} for {gold}${S.quest.reward}g`, 10, gy + 2, P.c.text);
@@ -18916,7 +18997,7 @@ var DW = window.DW = window.DW || {};
   function drawSkills(y) {
     const w = G.w, h = G.h, p = S.p;
     // equipped slots
-    F.draw(`Equipped (${p.slots.length}/${D.SLOTS}) — tap a skill to equip or remove it`, w >> 1, y, P.c.dim, { align: 'center' });
+    F.draw(`Tap a skill to equip it (${p.slots.length}/${D.SLOTS} slots)`, w >> 1, y, P.c.dim, { align: 'center' });
     y += 11;
     const sw = Math.floor((w - 8 - 8) / 3);
     for (let i = 0; i < D.SLOTS; i++) {
@@ -18956,12 +19037,12 @@ var DW = window.DW = window.DW || {};
         if (r) {
           F.draw(Gm.abilityName(a.id), 32, ry + 3, eq ? P.c.gold : P.c.bright, { shadow: true });
           F.draw('●'.repeat(r) + '○'.repeat(5 - r), w - 12, ry + 3, P.c.purple, { align: 'right' });
-          F.draw(a.ranks[r - 1], 32, ry + 13, P.c.text);
-          F.draw(`${Gm.abilityCost(a.id)} MP${r < 5 ? ' · next: ' + a.ranks[r] : ''}`, 32, ry + 22, '#778');
+          F.draw(F.fit(a.ranks[r - 1], w - 46), 32, ry + 13, P.c.text);
+          F.draw(F.fit(`${Gm.abilityCost(a.id)} MP${r < 5 ? ' · next: ' + a.ranks[r] : ''}`, w - 46), 32, ry + 22, '#889');
         } else {
-          F.draw(a.name, 32, ry + 3, '#667', { shadow: true });
-          F.draw(`Learned at level ${lvl}`, 32, ry + 13, '#556');
-          F.draw(a.desc, 32, ry + 22, '#445');
+          F.draw(a.name, 32, ry + 3, '#889', { shadow: true });
+          F.draw(`Learned at level ${lvl}`, 32, ry + 13, '#778');
+          F.draw(F.fit(a.desc, w - 46), 32, ry + 22, '#778');
         }
       });
     });
@@ -19176,6 +19257,7 @@ var DW = window.DW = window.DW || {};
         break;
       case 'enemyDie':
         st.dying = true; st.dieT = 0; st.flashT = 0.6;
+        st.hero = { act: 'victory', t: 0, dir: 0 }; st.heroT = 99;
         FX.shake(5, 0.4); FX.stop(0.12); FX.flash('#fff', 0.15);
         FX.dust(L.w >> 1, L.enemyFeetY, 24); FX.sparks(ex, ey, 24);
         App.sfx(st.enemy.tier >= 3 ? 'roar' : 'screech', { pitch: 0.7 });
@@ -19262,11 +19344,13 @@ var DW = window.DW = window.DW || {};
       }
       case 'player': break;   // waiting for a tap
       case 'windup': updateWindup(dt); break;
+      case 'between': break;   // a combo's second wind-up is queued behind the hit
       case 'after':
         st.afterT -= dt;
         if (st.afterT <= 0) st.phase = 'next';
         break;
       case 'ending':
+        if (!st.c.finished) C.finish();   // apply and save the outcome right away
         st.endT += dt;
         if (st.endT > 0.5 && !st.result) showResult();
         break;
@@ -19276,13 +19360,22 @@ var DW = window.DW = window.DW || {};
   function beginWindup(a) {
     st.phase = 'windup';
     st.windup = a; st.wt = 0;
-    st.guard = null; st.guardAt = 0; st.glinted = false; st.feinted = false;
+    // a guard raised between combo strikes carries over (as an early block, not a parry)
+    st.guard = st.preGuard === undefined ? null : st.preGuard; st.guardAt = 0;
+    st.preGuard = undefined;
+    st.glinted = false; st.feinted = false;
     st.pose = { f: 0, dir: a.dir, wind: 0.01, strike: 0, hurt: 0 };
-    st.hero = { act: 'idle', t: 0, dir: 0 };
+    st.hero = st.guard === null ? { act: 'idle', t: 0, dir: 0 } : { act: 'block', t: 0, dir: st.guard };
     App.sfx('whoosh', { pitch: 0.7, vol: 0.4 });
   }
 
   function setGuard(dir) {
+    if (st.phase === 'between') {
+      st.preGuard = dir;
+      st.hero = { act: 'block', t: 0, dir }; st.heroT = 9;
+      App.sfx('step', { pitch: 1.2, vol: 0.4 });
+      return;
+    }
     if (st.phase !== 'windup' || !st.windup) return;
     st.guard = dir; st.guardAt = st.wt;
     st.hero = { act: 'block', t: 0, dir }; st.heroT = 9;
@@ -19316,6 +19409,7 @@ var DW = window.DW = window.DW || {};
       pullEvents();
       if (r.combo && !st.c.over) {
         st.wait = 0.3;
+        st.phase = 'between'; st.windup = null;
         setTimeout0(() => beginWindup(r.combo));
       } else {
         st.phase = 'after'; st.afterT = 0.35;
@@ -19422,15 +19516,19 @@ var DW = window.DW = window.DW || {};
     const [sx, sy] = enemySide(dir);
     const pulse = Math.floor(App.t * 10) & 1;
     const col = pulse ? '#f65' : '#fd5';
-    const big = S.settings.assist;
+    // chevrons sit just outside the sprite so they never vanish into wings or fur
+    const d = enemyDef(), [ex0, ey0] = enemyOrigin();
+    const midY = ey0 + Math.round(d.h * 0.35);
+    const gx = dir < 0 ? Math.max(8, ex0 - 4) : dir > 0 ? Math.min(L.w - 8, ex0 + d.w + 4) : ex0 + (d.w >> 1);
+    const gy = dir === 0 ? Math.max(L.stageY + 20, ey0 - 4) : midY;
     const glyph = dir < 0 ? '◀' : dir > 0 ? '▶' : '▲';
-    const ox = dir < 0 ? -10 : dir > 0 ? 6 : -2, oy = dir === 0 ? -12 : 0;
-    if (big) F.big(glyph, sx + ox, sy + oy - 4, { scale: 2, ramp: 'blood', align: 'center' });
-    else F.draw(glyph, sx + ox, sy + oy, col, { outline: '#000' });
+    if (S.settings.assist || d.w >= 120) F.big(glyph, gx, gy - 6, { scale: 2, ramp: pulse ? 'gold' : 'fire', align: 'center' });
+    else F.draw(glyph, gx, gy, pulse ? '#fff' : col, { align: 'center', outline: '#000' });
+    void sx; void sy;
     // coaching for brand-new players: the first few attacks are spelled out
     if ((S.stats.blocks || 0) + (S.stats.parries || 0) < 3 && (S.stats.fights || 0) <= 3) {
-      const side = dir < 0 ? 'LEFT: tap ◀' : dir > 0 ? 'RIGHT: tap ▶' : 'ABOVE: tap ▲';
-      const txt = `It attacks from the ${side}`;
+      const side = dir < 0 ? 'from the LEFT: tap ◀' : dir > 0 ? 'from the RIGHT: tap ▶' : 'from ABOVE: tap ▲';
+      const txt = `It attacks ${side}`;
       const ty = L.stageY + 24;
       G.dither(0, ty - 3, L.w, 14, null, '#000', 11);
       F.draw(txt, L.w >> 1, ty, pulse ? '#fd5' : '#ffe', { align: 'center', shadow: true });
@@ -19462,8 +19560,8 @@ var DW = window.DW = window.DW || {};
     order.forEach((who, i) => {
       G.rect(x - 1, y - 1, 13, 13, i === 0 ? '#fd5' : '#000');
       const src = who === 'p' ? hp : por;
-      G.ctx.drawImage(src, 6, 4, 11, 11, x, y, 11, 11);
-      if (who === 'e') G.dither(x, y, 11, 11, null, '#d33', 3);
+      G.ctx.drawImage(src, 6, 7, 11, 11, x, y, 11, 11);
+      if (who === 'e' && i > 0) G.frame(x - 1, y - 1, 13, 13, '#a13');
       x += 14;
     });
   }
@@ -19523,7 +19621,7 @@ var DW = window.DW = window.DW || {};
   function drawActions() {
     const w = L.w, y = L.actY, h = L.h - L.actY;
     UI.panel(0, y, w, h, 'stone');
-    if (st.phase === 'windup') return drawBlockPad(y, h);
+    if (st.phase === 'windup' || st.phase === 'between') return drawBlockPad(y, h);
 
     const ready = st.phase === 'player' && !st.queue.length && st.wait <= 0;
     const pad = 5, gap = 4;
@@ -19561,17 +19659,19 @@ var DW = window.DW = window.DW || {};
     }
     // the menu grows upward over the log if needed
     const rowH = 26, n = opts.length;
-    const mh = n * (rowH + 3) + 28;
-    const my = L.h - mh - 4;
+    const mh = n * (rowH + 3) + 32;
+    const my = Math.max(L.stageY + 2, L.barY - mh - 2);   // keep your HP/MP bar in view
     UI.panel(2, my, w - 4, mh + 2, 'gold');
     opts.forEach((o, i) => {
       if (UI.button('m-' + o.id, 8, my + 6 + i * (rowH + 3), w - 16, rowH, o.label, { icon: o.icon, sub: o.sub, align: 'left', theme: o.ok ? o.theme : 'dark', disabled: !ready || !o.ok, key: String(i + 1), sound: false })) o.act();
     });
-    if (UI.button('m-back', 8, my + mh - 22, w - 16, 18, 'BACK', { key: 'Escape', sound: 'back' })) st.menu = null;
+    if (UI.button('m-back', 8, my + mh - 26, w - 16, 22, 'BACK', { key: 'Escape', sound: 'back' })) st.menu = null;
   }
 
   function drawBlockPad(y, h) {
-    const w = L.w, a = st.windup;
+    const w = L.w;
+    const a = st.windup || { windup: 1, parry: 0, breath: false, between: true };
+    if (a.between) st.wt = 0;
     // timer bar with the parry zone at the end
     const bx = 6, bw = w - 12, by = y + 4;
     const remain = Math.max(0, a.windup - st.wt);
@@ -19584,7 +19684,7 @@ var DW = window.DW = window.DW || {};
     const fill = Math.round(inner * Math.min(1, st.wt / a.windup));
     G.rect(bx + 1, by + 1, fill, 4, remain <= a.parry && !a.breath ? '#fe6' : '#d33');
     G.rect(bx + fill, by, 1, 6, '#fff');
-    F.draw(a.breath ? 'BREATH! block it — it cannot be parried' : remain <= a.parry ? 'NOW — PARRY!' : 'BLOCK THE ATTACK', w >> 1, by + 8, remain <= a.parry && !a.breath ? P.c.gold : P.c.text, { align: 'center', shadow: true });
+    F.draw(a.between ? 'IT STRIKES AGAIN — GUARD!' : a.breath ? 'BREATH! block it — it cannot be parried' : remain <= a.parry ? 'NOW — PARRY!' : 'BLOCK THE ATTACK', w >> 1, by + 8, remain <= a.parry && !a.breath ? P.c.gold : P.c.text, { align: 'center', shadow: true });
     const pad = 5, gap = 4, top = by + 19;
     const bh = y + h - top - pad;
     const cw = Math.floor((w - pad * 2 - gap * 2) / 3);
@@ -19592,14 +19692,20 @@ var DW = window.DW = window.DW || {};
     dirs.forEach(([d, label, keys], i) => {
       const x = pad + i * (cw + gap);
       const hint = S.settings.assist && d === st.pose.dir;
-      UI.button('blk' + d, x, top, cw, bh, label, { theme: st.guard === d ? 'gold' : hint ? 'red' : 'steel', sound: false });
+      const on = a.between ? st.preGuard === d : st.guard === d;
+      UI.button('blk' + d, x, top, cw, bh, label, { theme: on ? 'gold' : hint && !a.between ? 'red' : 'steel', sound: false });
       // react on touch-down, not release: blocking must be instant. Each press re-times the guard.
       if (UI.enabled && UI.pointer.pressed && UI.active === 'blk' + d) setGuard(d);
       if (keys.some(k => UI.key(k))) setGuard(d);
     });
-    // swipes on the stage
-    const sw = UI.swipe(0, L.stageY, w, L.stageH);
-    if (sw === 'L') setGuard(-1); else if (sw === 'R') setGuard(1); else if (sw === 'U') setGuard(0);
+    // swipes on the stage count as soon as the finger has travelled, not on lift
+    const pt = UI.pointer;
+    if (!pt.down) st.swiped = false;
+    else if (UI.enabled && !st.swiped && pt.moved >= 12 && pt.sy >= L.stageY && pt.sy < L.stageB) {
+      const dx = pt.x - pt.sx, dy = pt.y - pt.sy;
+      if (Math.abs(dx) > Math.abs(dy)) { st.swiped = true; setGuard(dx < 0 ? -1 : 1); }
+      else if (dy < 0) { st.swiped = true; setGuard(0); }
+    }
   }
 })();
 
@@ -19678,28 +19784,60 @@ var DW = window.DW = window.DW || {};
     if (DW.audio && DW.audio.music) DW.audio.music(name);
   };
 
-  let last = 0;
+  // A thrown error must never stop the loop (that freezes the game on one
+  // frame). Errors are shown on screen so a player can report them.
+  let last = 0, crash = null;
   function frame(now) {
+    requestAnimationFrame(frame);
     const dt = Math.min(0.05, Math.max(0, (now - (last || now)) / 1000));
     last = now;
-    UI.beginFrame();
-    FX.update(dt);
-    let gameDt = dt;
-    if (FX.hitstop > 0) { FX.hitstop -= dt; gameDt = 0; }
-    else if (FX.slowmo > 0) gameDt = dt * 0.4;
+    try {
+      UI.beginFrame();
+      if (G.rotateHint) { drawRotateHint(); UI.endFrame(); return; }
+      FX.update(dt);
+      let gameDt = dt;
+      if (FX.hitstop > 0) { FX.hitstop -= dt; gameDt = 0; }
+      else if (FX.slowmo > 0) gameDt = dt * 0.4;
+      G.clear('#000');
+      G.ctx.save();
+      App.frame(dt, gameDt);
+      G.ctx.restore();
+      UI.drawToasts(App.name === 'combat' ? 56 : App.HUD_H + 24);
+      FX.drawFlash();
+      FX.updateWipe(dt);
+      FX.drawWipe();
+      if (crash) drawCrash();
+      UI.endFrame();
+    } catch (e) {
+      try { G.ctx.restore(); } catch (_) { /* ignore */ }
+      if (!crash) console.error(e);
+      crash = { msg: String(e && e.message || e).slice(0, 160), where: App.name, t: performance.now() };
+      try { drawCrash(); UI.endFrame(); } catch (_) { /* ignore */ }
+    }
+  }
+
+  function drawCrash() {
+    const F = DW.font;
+    if (performance.now() - crash.t > 8000) { crash = null; return; }
+    const lines = F.wrap(`Something went wrong on the ${crash.where} screen: ${crash.msg}`, G.w - 20);
+    const h = lines.length * 10 + 8;
+    G.rect(4, G.h - h - 4, G.w - 8, h, '#300');
+    G.frame(4, G.h - h - 4, G.w - 8, h, '#f65');
+    lines.forEach((ln, i) => F.draw(ln, 10, G.h - h + i * 10, '#ffe'));
+  }
+
+  function drawRotateHint() {
+    const F = DW.font;
     G.clear('#000');
-    App.frame(dt, gameDt);
-    UI.drawToasts(App.name === 'combat' ? 40 : App.HUD_H + 4);
-    FX.drawFlash();
-    FX.updateWipe(dt);
-    FX.drawWipe();
-    UI.endFrame();
-    requestAnimationFrame(frame);
+    F.big('DARKWOOD', G.w >> 1, (G.h >> 1) - 30, { scale: 2, ramp: 'gold', align: 'center' });
+    F.draw('Please turn your phone upright', G.w >> 1, (G.h >> 1) + 2, '#ddc', { align: 'center' });
+    F.draw('to play.', G.w >> 1, (G.h >> 1) + 13, '#ddc', { align: 'center' });
   }
 
   DW.main = () => {
     const canvas = document.getElementById('screen');
     G.init(canvas, document.getElementById('wrap'));
+    Gm.loadSettings();
     UI.init(canvas);
     UI.onFirstGesture = () => {
       if (DW.audio && DW.audio.unlock) DW.audio.unlock();

@@ -780,8 +780,9 @@
     wl: { lean: -0.2, dx: -3, dy: -2, hx: -4, hy: 0, mo: 0.5, g: [42, 40], sa: 222, sl: 41, sw: 1, gap: 6, bL: 1, bR: -1, sb: 1, flare: 0.5 },
     wl5: { g: [44, 54], sa: 206, sl: 37, sb: 0, bL: 1, bR: -1, lean: -0.1 },
     // blade raised straight up over the crown, foreshortened as it tilts back
-    wh: { lean: 0, dx: 0, dy: -3, hx: 0, hy: 1, mo: 0.6, g: [60, 27], sa: 270, sl: 18, sw: 1.25, gap: 6, bL: -1, bR: 1, sb: 1, flare: -0.45, tilt: 0.4 },
-    wh5: { dy: 2, s: 0.99, g: [60, 36], sa: 270, sl: 28, sw: 1.15, gap: 6, bL: -1, bR: 1, sb: 1, flare: -0.25, mo: 0.4 },
+    // overhead: blade held level above the flaming hair (no headroom for it upright)
+    wh: { lean: 0, dx: 0, dy: -3, hx: 0, hy: 1, mo: 0.6, g: [40, 14], sa: 0, sl: 40, sw: 1.25, gap: 6, bL: -1, bR: 1, sb: 1, flare: -0.45, tilt: 0.4 },
+    wh5: { dy: 2, s: 0.99, g: [42, 24], sa: 0, sl: 36, sw: 1.15, gap: 6, bL: -1, bR: 1, sb: 1, flare: -0.25, mo: 0.4 },
     // blade cocked high over the screen-right shoulder
     wr: { lean: 0.2, dx: 3, dy: -2, hx: 4, hy: 0, mo: 0.5, g: [78, 40], sa: -42, sl: 41, sw: 1, gap: 6, bL: 1, bR: -1, sb: 1, flare: 0.5 },
     wr5: { g: [76, 54], sa: -26, sl: 37, sb: 0, bL: 1, bR: -1, lean: 0.1 },

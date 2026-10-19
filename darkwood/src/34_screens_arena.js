@@ -42,19 +42,20 @@
     },
     draw() {
       const w = G.w, h = G.h;
-      let y = App.header('arena', '', 64, { state: { tier: tierSel }, live: { cheer: 0.2 } });
-      F.big('THE ARENA', w >> 1, App.HUD_H + 22, { scale: 2, ramp: 'gold', align: 'center' });
+      const short = h < 440;
+      let y = App.header('arena', '', short ? 40 : 64, { state: { tier: tierSel }, live: { cheer: 0.2 } });
+      F.big('THE ARENA', w >> 1, App.HUD_H + (short ? 12 : 22), { scale: 2, ramp: 'gold', align: 'center' });
 
       const locked = [1, 2, 3, 4].map(t => !Gm.tierUnlocked(t));
-      const nt = UI.tabs('tiers', 4, y + 2, w - 8, 20, D.TIERS.map(t => 'RING ' + t.short), tierSel - 1, { locked });
+      const nt = UI.tabs('tiers', 4, y + 2, w - 8, 22, D.TIERS.map(t => 'RING ' + t.short), tierSel - 1, { locked });
       if (nt !== tierSel - 1) { tierSel = nt + 1; eSel = 0; App.sfx('tap'); }
-      y += 25;
+      y += 27;
       const tier = D.TIERS[tierSel - 1];
       F.draw(tier.name, 8, y + 2, P.c.gold, { shadow: true });
       const done = Gm.defeatedIn(tierSel);
       F.draw(`${done}/5 beaten`, w - 8, y + 2, done >= D.TIER_UNLOCK ? P.c.green : P.c.dim, { align: 'right', shadow: true });
       y += 12;
-      y += F.drawWrapped(tier.blurb, 8, y, w - 16, P.c.dim) + 2;
+      if (!short) y += F.drawWrapped(tier.blurb, 8, y, w - 16, P.c.dim) + 2;
 
       // enemy rows
       const list = tierEnemies(tierSel);
@@ -105,7 +106,8 @@
         F.draw(String(v), sx + 10, cy, P.c.text, { shadow: true });
         sx += 16 + F.measure(String(v)) + 6;
       }
-      F.draw(`${U.fmt(e.xp)} xp · ${U.fmt(e.gold)}g`, w - 10, cy, P.c.dim, { align: 'right' });
+      cy += 11;
+      F.draw(`Reward: {blue}${U.fmt(e.xp)} xp{/} · {gold}${U.fmt(e.gold)} gold`, 10, cy, P.c.dim);
       cy += 12;
       if (SPECIAL[e.special]) { F.draw(SPECIAL[e.special], 10, cy, P.c.text, { shadow: true }); cy += 11; }
       const moves = [];
@@ -124,9 +126,11 @@
           A.drawScene('arena', bx, cy, bw, boxH, App.t, { tier: e.tier }, { cheer: 0.1 });
           const img = A.enemyFrame(e.name, { f: Math.floor(App.t * 4) });
           const d = A.enemyDef(e.name) || { w: img.width, h: img.height, anchor: [img.width >> 1, img.height - 1] };
-          const feet = cy + boxH - 8;
+          // tall foes are shown head-first (legs cropped) so the face is never cut off
+          const top = d.anchor[1] > boxH - 10 ? cy + 3 : cy + boxH - 8 - d.anchor[1];
+          const feet = top + d.anchor[1];
           G.dither((w >> 1) - Math.floor(d.w / 3), feet - 2, Math.floor(d.w * 2 / 3), 4, null, '#000', 9);
-          G.blit(img, (w >> 1) - d.anchor[0], feet - d.anchor[1]);
+          G.blit(img, (w >> 1) - d.anchor[0], top);
         });
       }
       if (UI.button('fight', 10, y + detH - 28, w - 20, 22, 'FIGHT!', { theme: 'red', key: 'Enter', sound: false })) {
@@ -153,9 +157,9 @@
       const w = G.w, h = G.h, p = S.p;
       G.blit(G.cache(`herobg|${w}x${h}`, w, h - App.HUD_H, (cx, cw, ch) => G.copper(0, 0, cw, ch, ['#112', '#102', '#101'], cx, 6)), 0, App.HUD_H);
       let y = App.HUD_H + 4;
-      if (UI.button('hero-back', 4, y, 34, 20, '◀', { key: 'Escape', sound: 'back' })) App.go('town');
-      heroTab = UI.tabs('herotabs', 42, y, w - 46, 20, ['STATS', 'SKILLS', 'BESTIARY'], heroTab);
-      y += 26;
+      if (UI.button('hero-back', 4, y, 38, 22, '◀', { key: 'Escape', sound: 'back' })) App.go('town');
+      heroTab = UI.tabs('herotabs', 46, y, w - 50, 22, ['STATS', 'SKILLS', 'BESTIARY'], heroTab);
+      y += 28;
       if (heroTab === 0) drawStats(y);
       else if (heroTab === 1) drawSkills(y);
       else drawBestiary(y);
@@ -193,7 +197,7 @@
     statRow(R, ly, colW - 4, null, 'Dexterity', p.dex); ly += 11;
     statRow(L, ly, colW - 4, null, 'Constitution', p.con);
     statRow(R, ly, colW - 4, null, 'Gold', U.fmt(p.gold), P.c.gold); ly += 11;
-    F.draw('STR: damage · DEX: speed, defense, crit · CON: health', w >> 1, ly + 1, '#667', { align: 'center' });
+    F.draw('STR dmg · DEX spd/def/crit · CON hp', w >> 1, ly + 1, '#889', { align: 'center' });
     y += 80;
 
     // gear & pack
@@ -208,7 +212,7 @@
       F.draw(line, 30, gy + 9, P.c.dim);
       gy += 21;
     };
-    gearRow('w_' + wp.look, wp.name, `${wp.damage_min}-${wp.damage_max} dmg · SPD ${wp.speed >= 0 ? '+' : ''}${wp.speed}`);
+    gearRow('w_' + wp.look, wp.name, `${a0}-${a1} dmg · SPD ${wp.speed >= 0 ? '+' : ''}${wp.speed}`);
     const ar = Gm.armorData(), rg = Gm.ringData();
     gearRow(ar ? ar.icon : 'a_leather', ar ? ar.name : 'No armour', ar ? `+${ar.value} defense` : 'Buy some at the Apothecary');
     if (rg) gearRow(rg.icon, rg.name, `+${rg.value} defense`);
@@ -218,7 +222,10 @@
     if (pack.length && gy + 20 < y + gearH) {
       F.draw('Pack:', 10, gy + 4, P.c.dim);
       let px = 40;
-      for (const [ic, c] of pack) { G.blit(A.icon(ic), px, gy + 1); F.draw('×' + c, px + 15, gy + 4, P.c.text); px += 34; }
+      for (const [ic, c] of pack) {
+        if (px + 30 > w - 6) { px = 40; gy += 17; }
+        G.blit(A.icon(ic), px, gy + 1); F.draw('×' + c, px + 15, gy + 4, P.c.text); px += 32;
+      }
       gy += 20;
     }
     if (S.quest && gy + 12 < y + gearH) F.draw(`Oath: slay the {red}${S.quest.enemy}{/} for {gold}${S.quest.reward}g`, 10, gy + 2, P.c.text);
@@ -227,7 +234,7 @@
   function drawSkills(y) {
     const w = G.w, h = G.h, p = S.p;
     // equipped slots
-    F.draw(`Equipped (${p.slots.length}/${D.SLOTS}) — tap a skill to equip or remove it`, w >> 1, y, P.c.dim, { align: 'center' });
+    F.draw(`Tap a skill to equip it (${p.slots.length}/${D.SLOTS} slots)`, w >> 1, y, P.c.dim, { align: 'center' });
     y += 11;
     const sw = Math.floor((w - 8 - 8) / 3);
     for (let i = 0; i < D.SLOTS; i++) {
@@ -267,12 +274,12 @@
         if (r) {
           F.draw(Gm.abilityName(a.id), 32, ry + 3, eq ? P.c.gold : P.c.bright, { shadow: true });
           F.draw('●'.repeat(r) + '○'.repeat(5 - r), w - 12, ry + 3, P.c.purple, { align: 'right' });
-          F.draw(a.ranks[r - 1], 32, ry + 13, P.c.text);
-          F.draw(`${Gm.abilityCost(a.id)} MP${r < 5 ? ' · next: ' + a.ranks[r] : ''}`, 32, ry + 22, '#778');
+          F.draw(F.fit(a.ranks[r - 1], w - 46), 32, ry + 13, P.c.text);
+          F.draw(F.fit(`${Gm.abilityCost(a.id)} MP${r < 5 ? ' · next: ' + a.ranks[r] : ''}`, w - 46), 32, ry + 22, '#889');
         } else {
-          F.draw(a.name, 32, ry + 3, '#667', { shadow: true });
-          F.draw(`Learned at level ${lvl}`, 32, ry + 13, '#556');
-          F.draw(a.desc, 32, ry + 22, '#445');
+          F.draw(a.name, 32, ry + 3, '#889', { shadow: true });
+          F.draw(`Learned at level ${lvl}`, 32, ry + 13, '#778');
+          F.draw(F.fit(a.desc, w - 46), 32, ry + 22, '#778');
         }
       });
     });

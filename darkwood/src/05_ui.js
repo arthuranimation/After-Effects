@@ -43,12 +43,21 @@
     });
     const up = e => {
       if (!p.down) return;
-      [p.x, p.y] = toLogical(e);
+      // Some in-app viewers cancel the pointer mid-tap and report (0,0); keep the
+      // last known position in that case so the tap still lands where it began.
+      if (e.type !== 'pointercancel' || e.clientX || e.clientY) [p.x, p.y] = toLogical(e);
       p.down = false; flagUp = true; upPos = [p.x, p.y];
     };
     canvas.addEventListener('pointerup', up);
     canvas.addEventListener('pointercancel', up);
+    window.addEventListener('pointerup', up);
     canvas.addEventListener('contextmenu', e => e.preventDefault());
+    // Stop the browser / host app treating touches as scroll or zoom gestures
+    // (which cancels the pointer before the tap completes).
+    const block = e => { if (e.cancelable) e.preventDefault(); };
+    canvas.addEventListener('touchstart', block, { passive: false });
+    canvas.addEventListener('touchmove', block, { passive: false });
+    canvas.addEventListener('touchend', block, { passive: false });
     window.addEventListener('keydown', e => {
       if (e.repeat) return;
       keysDown.add(e.key); keyQueue.add(e.key);
@@ -119,7 +128,7 @@
     purple: { face: '#426', hi: '#b8e', mid: '#74a', lo: '#101', text: '#dbf', sub: '#b8e' },
     green:  { face: '#243', hi: '#9c7', mid: '#475', lo: '#010', text: '#ce9', sub: '#9c7' },
     blue:   { face: '#248', hi: '#8de', mid: '#37a', lo: '#002', text: '#eff', sub: '#8de' },
-    gold:   { face: '#a70', hi: '#ffb', mid: '#eb3', lo: '#320', text: '#210', sub: '#530' },
+    gold:   { face: '#a70', hi: '#ffb', mid: '#eb3', lo: '#320', text: '#210', sub: '#210' },
     steel:  { face: '#345', hi: '#bcd', mid: '#689', lo: '#101', text: '#eef', sub: '#bcd' },
     dark:   { face: '#223', hi: '#556', mid: '#334', lo: '#000', text: '#ddc', sub: '#889' },
   };
@@ -265,8 +274,10 @@
     // content = [icon] + a column holding the label and (optionally) a sub-label
     let iconW = 0;
     if (o.icon) iconW = o.icon.width + (label || o.sub ? 4 : 0);
+    if (label) label = F.fit(label, w - iconW - 8);
+    const sub = o.sub ? F.fit(o.sub, w - iconW - 10) : '';
     const lw = label ? F.measure(label) : 0;
-    const sw = o.sub ? Math.min(F.measure(o.sub), w - iconW - 10) : 0;
+    const sw = sub ? F.measure(sub) : 0;
     const colW = Math.max(lw, sw);
     const contentH = 7 + (o.sub ? 10 : 0);
     let cx = o.align === 'left' ? x + 6 : x + Math.floor((w - iconW - colW) / 2);
@@ -278,8 +289,8 @@
     }
     const center = o.align !== 'left';
     if (label) F.draw(label, cx + off + (center ? Math.floor((colW - lw) / 2) : 0), cy, textCol, { shadow });
-    if (o.sub) {
-      F.draw(o.sub, cx + off + (center ? Math.floor((colW - sw) / 2) : 0), cy + 10, o.disabled ? '#556' : T.sub, { shadow: '#000' });
+    if (sub) {
+      F.draw(sub, cx + off + (center ? Math.floor((colW - sw) / 2) : 0), cy + 10, o.disabled ? '#556' : T.sub, { shadow: '#000' });
     }
     if (clicked && o.sound !== false) sfx(o.sound || 'tap');
     return clicked;
@@ -399,13 +410,15 @@
   };
   UI.drawToasts = (top = 30) => {
     const now = performance.now();
-    toasts.forEach((t, i) => {
+    let ty = top;
+    toasts.forEach(t => {
       const age = now - t.born;
       const lines = F.wrap(t.text, G.w - 40);
       const w = Math.min(G.w - 16, Math.max(...lines.map(l => F.measure(l))) + 14);
       const h = lines.length * 10 + 6;
       const x = Math.floor((G.w - w) / 2);
-      const y = top + i * (h + 3) - Math.max(0, 6 - age / 25) | 0;
+      const y = ty - Math.max(0, 6 - age / 25) | 0;
+      ty += h + 3;
       G.rect(x, y, w, h, '#000');
       G.rect(x + 1, y + 1, w - 2, h - 2, '#112');
       G.hline(x + 1, x + w - 2, y + 1, '#445');

@@ -139,8 +139,10 @@
     return gained;
   };
 
-  // Abilities that can still be ranked up.
-  Gm.masteryOptions = () => Gm.learnedList().filter(id => Gm.rank(id) < 5);
+  // Skill ranks are capped by level (rank 2 at level 3, 3 at 6, 4 at 9, 5 at 12)
+  // so a rank-5 skill can't be rushed at level 5.
+  Gm.maxRank = () => Math.min(5, 1 + Math.floor(S.p.level / 3));
+  Gm.masteryOptions = () => Gm.learnedList().filter(id => Gm.rank(id) < Gm.maxRank());
 
   // choice: 'vitality' | 'arcane' | 'mastery' (with ability id). Restores HP and MP fully.
   Gm.chooseLevelReward = (choice, abilityId) => {
@@ -154,7 +156,7 @@
     } else if (choice === 'arcane') {
       p.maxMp += Gm.ARCANE_GAIN;
       msg = `+${Gm.ARCANE_GAIN} max MP`;
-    } else if (choice === 'mastery' && abilityId && Gm.rank(abilityId) > 0 && Gm.rank(abilityId) < 5) {
+    } else if (choice === 'mastery' && abilityId && Gm.rank(abilityId) > 0 && Gm.rank(abilityId) < Gm.maxRank()) {
       p.learned[abilityId]++;
       msg = `${Gm.abilityName(abilityId)} (rank ${p.learned[abilityId]})`;
     } else {
@@ -168,7 +170,8 @@
   // ---------------------------------------------------------------
   // Shops. All return { ok, msg }.
   // ---------------------------------------------------------------
-  Gm.weaponPrice = w => Math.max(0, w.cost - Gm.tradeIn(Gm.weaponData().cost));
+  // Price after trade-in. Negative = the shop pays you the difference (a trade-down).
+  Gm.weaponPrice = w => w.cost - Gm.tradeIn(Gm.weaponData().cost);
   Gm.buyWeapon = name => {
     const w = Gm.weaponData(name);
     if (!w || w.name === S.p.weapon) return { ok: false, msg: 'Already equipped.' };
@@ -176,13 +179,20 @@
     if (S.p.gold < price) return { ok: false, msg: `You need ${U.fmt(price)} gold.` };
     S.p.gold -= price;
     S.p.weapon = w.name;
-    return { ok: true, msg: `Equipped the ${w.name}.` };
+    return { ok: true, msg: `Equipped the ${w.name}.` + (price < 0 ? ` (+${-price}g back)` : '') };
   };
 
   Gm.itemPrice = item => {
-    if (item.type === 'armor') return Math.max(0, item.cost - Gm.tradeIn(Gm.armorData() ? Gm.armorData().cost : 0));
-    if (item.type === 'ring') return Math.max(0, item.cost - Gm.tradeIn(Gm.ringData() ? Gm.ringData().cost : 0));
+    if (item.type === 'armor') return item.cost - Gm.tradeIn(Gm.armorData() ? Gm.armorData().cost : 0);
+    if (item.type === 'ring') return item.cost - Gm.tradeIn(Gm.ringData() ? Gm.ringData().cost : 0);
     return item.cost;
+  };
+  // True when buying this would replace better gear you already wear.
+  Gm.isDowngrade = item => {
+    if (item.type === 'armor' && Gm.armorData()) return item.value < Gm.armorData().value;
+    if (item.type === 'ring' && Gm.ringData()) return item.value < Gm.ringData().value;
+    if (item.damage_max !== undefined) return item.cost < Gm.weaponData().cost;
+    return false;
   };
 
   Gm.itemStatus = item => {
@@ -284,7 +294,14 @@
   // ---------------------------------------------------------------
   // Save / load (localStorage). Old v1/v2 saves from Darkwood 8 migrate.
   // ---------------------------------------------------------------
+  Gm.SETTINGS_KEY = 'darkwood_settings';
+  Gm.saveSettings = () => { try { localStorage.setItem(Gm.SETTINGS_KEY, JSON.stringify(S.settings)); } catch (_) { /* ignore */ } };
+  Gm.loadSettings = () => {
+    try { Object.assign(S.settings, JSON.parse(localStorage.getItem(Gm.SETTINGS_KEY) || '{}') || {}); } catch (_) { /* ignore */ }
+  };
+
   Gm.save = () => {
+    Gm.saveSettings();
     if (!S.p) return false;
     const data = { v: Gm.VERSION, player: S.p, quest: S.quest, flags: S.flags, settings: S.settings, stats: S.stats };
     try { localStorage.setItem(Gm.SAVE_KEY, JSON.stringify(data)); return true; } catch (_) { return false; }
@@ -309,15 +326,26 @@
         const base = Gm.freshPlayer();
         const pd = data.player;
         S.p = Object.assign(base, pd);
-        S.p.potions = pd.potions || {}; S.p.wands = pd.wands || {}; S.p.tomes = pd.tomes || {};
-        S.p.learned = pd.learned || { double_slash: 1 };
-        S.p.slots = (pd.slots || []).filter(id => S.p.learned[id]).slice(0, D.SLOTS);
-        S.p.defeated = pd.defeated || {};
-        S.p.pendingLevels = pd.pendingLevels || [];
+        // keep only things the current data tables know about, so a renamed item
+        // or a damaged field can never break the game
+        const obj = v => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+        const counts = (v, ok) => Object.fromEntries(Object.entries(obj(v)).filter(([n, c]) => ok(n) && typeof c === 'number' && c > 0));
+        S.p.potions = counts(pd.potions, n => { const i = Gm.itemData(n); return i && (i.type === 'potion' || i.type === 'mana'); });
+        S.p.wands = counts(pd.wands, n => { const i = Gm.itemData(n); return i && i.type === 'wand'; });
+        S.p.tomes = obj(pd.tomes);
+        S.p.learned = counts(pd.learned, id => !!Gm.abilityData(id));
+        if (!Object.keys(S.p.learned).length) S.p.learned = { double_slash: 1 };
+        S.p.slots = (Array.isArray(pd.slots) ? pd.slots : []).filter(id => S.p.learned[id]).slice(0, D.SLOTS);
+        S.p.defeated = counts(pd.defeated, n => !!Gm.enemyData(n));
+        S.p.pendingLevels = (Array.isArray(pd.pendingLevels) ? pd.pendingLevels : []).filter(n => typeof n === 'number');
+        if (S.p.armor && !Gm.itemData(S.p.armor)) S.p.armor = null;
+        if (S.p.ring && !Gm.itemData(S.p.ring)) S.p.ring = null;
+        for (const k of ['level', 'xp', 'hp', 'maxHp', 'mp', 'maxMp', 'gold', 'str', 'dex', 'con']) if (typeof S.p[k] !== 'number' || !isFinite(S.p[k])) S.p[k] = Gm.freshPlayer()[k];
         if (!D.WEAPONS.find(w => w.name === S.p.weapon)) S.p.weapon = 'Dagger';
         S.quest = data.quest || null;
         S.flags = Object.assign({ gateOpen: false, victorySeen: false }, data.flags || {});
         S.settings = Object.assign({ assist: false }, data.settings || {});
+        Gm.loadSettings();   // settings changed on the title screen win
         S.stats = Object.assign({ fights: 0, wins: 0, losses: 0, blocks: 0, parries: 0, crits: 0, bestStreak: 0 }, data.stats || {});
       } else {
         Gm.migrate(data);
@@ -337,8 +365,12 @@
     p.name = pd.name || 'Derek';
     p.level = Math.max(1, num(pd.level, 1));
     p.xp = Math.max(0, num(pd.xp, 0));
-    p.maxHp = Math.max(30, num(pd.maxHp, 30));
-    p.hp = U.clamp(num(pd.hp, p.maxHp), 1, p.maxHp);
+    // 8.0 heroes only gained HP from Vitality picks; v9 also grants HP every level.
+    const oldMax = Math.max(30, num(pd.maxHp, 30));
+    const vitPicks = Math.max(0, Math.round((oldMax - 30) / (10 + Math.max(0, Gm.bonus(num(pd.con, 10))))));
+    p.con = num(pd.con, 10);
+    p.maxHp = 30 + (p.level - 1) * Gm.hpPerLevel() + vitPicks * Gm.vitalityGain();
+    p.hp = Math.max(1, Math.round(p.maxHp * U.clamp(num(pd.hp, oldMax) / oldMax, 0, 1)));
     const oldMaxMp = num(pd.maxMp, 5);
     const arcanePicks = Math.max(0, Math.round((oldMaxMp - 5) / 2));
     p.maxMp = 10 + (p.level - 1) + arcanePicks * Gm.ARCANE_GAIN;
@@ -360,5 +392,7 @@
     if (!p.slots.length) p.slots = Object.keys(p.learned).slice(0, D.SLOTS);
     if (data.quest && Gm.enemyData(data.quest.enemyName)) S.quest = { enemy: data.quest.enemyName, reward: num(data.quest.reward, 100), giver: 0 };
     if (p.defeated[D.FINAL_BOSS]) S.flags.gateOpen = true;
+    Gm.loadSettings();
+    Gm.save();
   };
 })();

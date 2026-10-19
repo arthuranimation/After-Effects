@@ -182,6 +182,7 @@
         break;
       case 'enemyDie':
         st.dying = true; st.dieT = 0; st.flashT = 0.6;
+        st.hero = { act: 'victory', t: 0, dir: 0 }; st.heroT = 99;
         FX.shake(5, 0.4); FX.stop(0.12); FX.flash('#fff', 0.15);
         FX.dust(L.w >> 1, L.enemyFeetY, 24); FX.sparks(ex, ey, 24);
         App.sfx(st.enemy.tier >= 3 ? 'roar' : 'screech', { pitch: 0.7 });
@@ -268,11 +269,13 @@
       }
       case 'player': break;   // waiting for a tap
       case 'windup': updateWindup(dt); break;
+      case 'between': break;   // a combo's second wind-up is queued behind the hit
       case 'after':
         st.afterT -= dt;
         if (st.afterT <= 0) st.phase = 'next';
         break;
       case 'ending':
+        if (!st.c.finished) C.finish();   // apply and save the outcome right away
         st.endT += dt;
         if (st.endT > 0.5 && !st.result) showResult();
         break;
@@ -282,13 +285,22 @@
   function beginWindup(a) {
     st.phase = 'windup';
     st.windup = a; st.wt = 0;
-    st.guard = null; st.guardAt = 0; st.glinted = false; st.feinted = false;
+    // a guard raised between combo strikes carries over (as an early block, not a parry)
+    st.guard = st.preGuard === undefined ? null : st.preGuard; st.guardAt = 0;
+    st.preGuard = undefined;
+    st.glinted = false; st.feinted = false;
     st.pose = { f: 0, dir: a.dir, wind: 0.01, strike: 0, hurt: 0 };
-    st.hero = { act: 'idle', t: 0, dir: 0 };
+    st.hero = st.guard === null ? { act: 'idle', t: 0, dir: 0 } : { act: 'block', t: 0, dir: st.guard };
     App.sfx('whoosh', { pitch: 0.7, vol: 0.4 });
   }
 
   function setGuard(dir) {
+    if (st.phase === 'between') {
+      st.preGuard = dir;
+      st.hero = { act: 'block', t: 0, dir }; st.heroT = 9;
+      App.sfx('step', { pitch: 1.2, vol: 0.4 });
+      return;
+    }
     if (st.phase !== 'windup' || !st.windup) return;
     st.guard = dir; st.guardAt = st.wt;
     st.hero = { act: 'block', t: 0, dir }; st.heroT = 9;
@@ -322,6 +334,7 @@
       pullEvents();
       if (r.combo && !st.c.over) {
         st.wait = 0.3;
+        st.phase = 'between'; st.windup = null;
         setTimeout0(() => beginWindup(r.combo));
       } else {
         st.phase = 'after'; st.afterT = 0.35;
@@ -428,15 +441,19 @@
     const [sx, sy] = enemySide(dir);
     const pulse = Math.floor(App.t * 10) & 1;
     const col = pulse ? '#f65' : '#fd5';
-    const big = S.settings.assist;
+    // chevrons sit just outside the sprite so they never vanish into wings or fur
+    const d = enemyDef(), [ex0, ey0] = enemyOrigin();
+    const midY = ey0 + Math.round(d.h * 0.35);
+    const gx = dir < 0 ? Math.max(8, ex0 - 4) : dir > 0 ? Math.min(L.w - 8, ex0 + d.w + 4) : ex0 + (d.w >> 1);
+    const gy = dir === 0 ? Math.max(L.stageY + 20, ey0 - 4) : midY;
     const glyph = dir < 0 ? '◀' : dir > 0 ? '▶' : '▲';
-    const ox = dir < 0 ? -10 : dir > 0 ? 6 : -2, oy = dir === 0 ? -12 : 0;
-    if (big) F.big(glyph, sx + ox, sy + oy - 4, { scale: 2, ramp: 'blood', align: 'center' });
-    else F.draw(glyph, sx + ox, sy + oy, col, { outline: '#000' });
+    if (S.settings.assist || d.w >= 120) F.big(glyph, gx, gy - 6, { scale: 2, ramp: pulse ? 'gold' : 'fire', align: 'center' });
+    else F.draw(glyph, gx, gy, pulse ? '#fff' : col, { align: 'center', outline: '#000' });
+    void sx; void sy;
     // coaching for brand-new players: the first few attacks are spelled out
     if ((S.stats.blocks || 0) + (S.stats.parries || 0) < 3 && (S.stats.fights || 0) <= 3) {
-      const side = dir < 0 ? 'LEFT: tap ◀' : dir > 0 ? 'RIGHT: tap ▶' : 'ABOVE: tap ▲';
-      const txt = `It attacks from the ${side}`;
+      const side = dir < 0 ? 'from the LEFT: tap ◀' : dir > 0 ? 'from the RIGHT: tap ▶' : 'from ABOVE: tap ▲';
+      const txt = `It attacks ${side}`;
       const ty = L.stageY + 24;
       G.dither(0, ty - 3, L.w, 14, null, '#000', 11);
       F.draw(txt, L.w >> 1, ty, pulse ? '#fd5' : '#ffe', { align: 'center', shadow: true });
@@ -468,8 +485,8 @@
     order.forEach((who, i) => {
       G.rect(x - 1, y - 1, 13, 13, i === 0 ? '#fd5' : '#000');
       const src = who === 'p' ? hp : por;
-      G.ctx.drawImage(src, 6, 4, 11, 11, x, y, 11, 11);
-      if (who === 'e') G.dither(x, y, 11, 11, null, '#d33', 3);
+      G.ctx.drawImage(src, 6, 7, 11, 11, x, y, 11, 11);
+      if (who === 'e' && i > 0) G.frame(x - 1, y - 1, 13, 13, '#a13');
       x += 14;
     });
   }
@@ -529,7 +546,7 @@
   function drawActions() {
     const w = L.w, y = L.actY, h = L.h - L.actY;
     UI.panel(0, y, w, h, 'stone');
-    if (st.phase === 'windup') return drawBlockPad(y, h);
+    if (st.phase === 'windup' || st.phase === 'between') return drawBlockPad(y, h);
 
     const ready = st.phase === 'player' && !st.queue.length && st.wait <= 0;
     const pad = 5, gap = 4;
@@ -567,17 +584,19 @@
     }
     // the menu grows upward over the log if needed
     const rowH = 26, n = opts.length;
-    const mh = n * (rowH + 3) + 28;
-    const my = L.h - mh - 4;
+    const mh = n * (rowH + 3) + 32;
+    const my = Math.max(L.stageY + 2, L.barY - mh - 2);   // keep your HP/MP bar in view
     UI.panel(2, my, w - 4, mh + 2, 'gold');
     opts.forEach((o, i) => {
       if (UI.button('m-' + o.id, 8, my + 6 + i * (rowH + 3), w - 16, rowH, o.label, { icon: o.icon, sub: o.sub, align: 'left', theme: o.ok ? o.theme : 'dark', disabled: !ready || !o.ok, key: String(i + 1), sound: false })) o.act();
     });
-    if (UI.button('m-back', 8, my + mh - 22, w - 16, 18, 'BACK', { key: 'Escape', sound: 'back' })) st.menu = null;
+    if (UI.button('m-back', 8, my + mh - 26, w - 16, 22, 'BACK', { key: 'Escape', sound: 'back' })) st.menu = null;
   }
 
   function drawBlockPad(y, h) {
-    const w = L.w, a = st.windup;
+    const w = L.w;
+    const a = st.windup || { windup: 1, parry: 0, breath: false, between: true };
+    if (a.between) st.wt = 0;
     // timer bar with the parry zone at the end
     const bx = 6, bw = w - 12, by = y + 4;
     const remain = Math.max(0, a.windup - st.wt);
@@ -590,7 +609,7 @@
     const fill = Math.round(inner * Math.min(1, st.wt / a.windup));
     G.rect(bx + 1, by + 1, fill, 4, remain <= a.parry && !a.breath ? '#fe6' : '#d33');
     G.rect(bx + fill, by, 1, 6, '#fff');
-    F.draw(a.breath ? 'BREATH! block it — it cannot be parried' : remain <= a.parry ? 'NOW — PARRY!' : 'BLOCK THE ATTACK', w >> 1, by + 8, remain <= a.parry && !a.breath ? P.c.gold : P.c.text, { align: 'center', shadow: true });
+    F.draw(a.between ? 'IT STRIKES AGAIN — GUARD!' : a.breath ? 'BREATH! block it — it cannot be parried' : remain <= a.parry ? 'NOW — PARRY!' : 'BLOCK THE ATTACK', w >> 1, by + 8, remain <= a.parry && !a.breath ? P.c.gold : P.c.text, { align: 'center', shadow: true });
     const pad = 5, gap = 4, top = by + 19;
     const bh = y + h - top - pad;
     const cw = Math.floor((w - pad * 2 - gap * 2) / 3);
@@ -598,13 +617,19 @@
     dirs.forEach(([d, label, keys], i) => {
       const x = pad + i * (cw + gap);
       const hint = S.settings.assist && d === st.pose.dir;
-      UI.button('blk' + d, x, top, cw, bh, label, { theme: st.guard === d ? 'gold' : hint ? 'red' : 'steel', sound: false });
+      const on = a.between ? st.preGuard === d : st.guard === d;
+      UI.button('blk' + d, x, top, cw, bh, label, { theme: on ? 'gold' : hint && !a.between ? 'red' : 'steel', sound: false });
       // react on touch-down, not release: blocking must be instant. Each press re-times the guard.
       if (UI.enabled && UI.pointer.pressed && UI.active === 'blk' + d) setGuard(d);
       if (keys.some(k => UI.key(k))) setGuard(d);
     });
-    // swipes on the stage
-    const sw = UI.swipe(0, L.stageY, w, L.stageH);
-    if (sw === 'L') setGuard(-1); else if (sw === 'R') setGuard(1); else if (sw === 'U') setGuard(0);
+    // swipes on the stage count as soon as the finger has travelled, not on lift
+    const pt = UI.pointer;
+    if (!pt.down) st.swiped = false;
+    else if (UI.enabled && !st.swiped && pt.moved >= 12 && pt.sy >= L.stageY && pt.sy < L.stageB) {
+      const dx = pt.x - pt.sx, dy = pt.y - pt.sy;
+      if (Math.abs(dx) > Math.abs(dy)) { st.swiped = true; setGuard(dx < 0 ? -1 : 1); }
+      else if (dy < 0) { st.swiped = true; setGuard(0); }
+    }
   }
 })();

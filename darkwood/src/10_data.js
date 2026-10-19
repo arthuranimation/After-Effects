@@ -100,7 +100,7 @@
       ranks: ['Guaranteed escape', 'Escape, keep 25% of its gold', 'Escape, keep 50% of its gold', 'Escape, keep 75% of its gold', 'Escape with all its gold and half its XP'] },
     { id: 'rallying_cry',   name: 'Rallying Cry',   rank5Name: 'War Hymn',         mp: 6,  icon: 'ab_rallying_cry',
       desc: 'Find your second wind.',
-      ranks: ['Restore 15% HP', 'Restore 20% HP', 'Restore 25% HP, cure 1 ailment', 'Restore 30% HP, cure all ailments', 'Restore 35% HP, cure all, act sooner'] },
+      ranks: ['Restore 15% HP', 'Restore 20% HP', 'Restore 25% HP, cure exhaustion', 'Restore 30% HP, cure exhaustion', 'Restore 35% HP, cure exhaustion, act sooner'] },
     { id: 'speed_warrior',  name: 'Speed Warrior',  rank5Name: 'Blur',             mp: 6,  icon: 'ab_speed_warrior',
       desc: "Match the enemy's speed, plus a step.",
       ranks: ['3 turns', '4 turns', '4 turns, +10% damage', '5 turns, +10% damage', '5 turns, +15% damage, act at once'] },

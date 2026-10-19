@@ -96,7 +96,7 @@
       F.big(title, G.w >> 1, ty + 2, { scale: 2, ramp: opts.ramp || 'gold', align: 'center' });
     }
     if (opts.back !== false) {
-      if (UI.button('hdr-back', 4, y + 4, 34, 18, '◀', { theme: 'stone', key: 'Escape', sound: 'back' })) App.go(opts.backTo || 'town');
+      if (UI.button('hdr-back', 4, y + 4, 38, 22, '◀', { theme: 'stone', key: 'Escape', sound: 'back' })) App.go(opts.backTo || 'town');
     }
     return y + h + 2;
   };
@@ -236,7 +236,7 @@
           UI.toast('{blue}' + Gm.chooseLevelReward('arcane'), P.c.text); App.save(); sfx('magic');
         }
         cy += 34;
-        if (UI.button('lu-mas', x + 8, cy, bw, 30, 'MASTERY', { icon: A.icon('m_skills'), theme: 'purple', sub: opts.length ? 'Rank up a skill' : 'All skills mastered', disabled: !opts.length, key: '3' })) {
+        if (UI.button('lu-mas', x + 8, cy, bw, 30, 'MASTERY', { icon: A.icon('m_skills'), theme: 'purple', sub: opts.length ? 'Rank up a skill' : Gm.maxRank() < 5 ? `Next rank opens at level ${(Gm.maxRank()) * 3}` : 'All skills mastered', disabled: !opts.length, key: '3' })) {
           mastery = true;
         }
       },

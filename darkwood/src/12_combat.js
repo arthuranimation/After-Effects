@@ -57,7 +57,8 @@
   C.enemySpeed = (c = S.combat) => {
     let spd = c.enemy.speed;
     const sl = st(c.est, 'slow'); if (sl) spd *= 1 - sl.pct;
-    const sh = st(c.est, 'shatter'); if (sh && sh.spdPct) spd *= 1 - sh.spdPct;
+    const sh = st(c.est, 'shatter');
+    if (sh && sh.spdPct) return Math.max(1, Math.min(Math.round(spd) - 1, Math.floor(spd * (1 - sh.spdPct))));
     return Math.max(1, Math.round(spd));
   };
 
@@ -322,8 +323,8 @@
         ev(c, { t: 'counter' });
         if (rip.rank >= 4) addSt(c.est, { type: 'stun', turns: 1 });
         if (hurtEnemy(c, h.dmg, 'counter', h.crit)) { if (c.over) return {}; }
+        if (--rip.charges <= 0) dropSt(c.pst, 'riposte');
       }
-      if (--rip.charges <= 0) dropSt(c.pst, 'riposte');
     }
 
     if (!c.over && a.combo && !a.isCombo) {
@@ -475,8 +476,8 @@
         const pct = [0.33, 0.4, 0.4, 0.45, 0.5][r - 1], turns = [3, 3, 4, 4, 5][r - 1];
         say(c, `${name}: ice shards hit for ${h.dmg}. Slowed ${Math.round(pct * 100)}%!`, 'ice');
         if (hurtEnemy(c, h.dmg, 'ice', h.crit)) break;
-        addSt(c.est, { type: 'slow', turns, pct, fresh: true });
-        if (r >= 4) addSt(c.est, { type: 'frost', turns, value: 2 + Math.floor(p.level / 2), fresh: true });
+        addSt(c.est, { type: 'slow', turns, pct });
+        if (r >= 4) addSt(c.est, { type: 'frost', turns, value: 2 + Math.floor(p.level / 2) });
         if (r >= 5) { addSt(c.est, { type: 'stun', turns: 1 }); say(c, `The ${c.enemy.name} is frozen solid!`, 'ice'); }
         break;
       }
@@ -484,7 +485,7 @@
         const turns = [3, 4, 4, 5, 5][r - 1], bonus = [0, 0, 0.1, 0.1, 0.15][r - 1];
         addSt(c.pst, { type: 'surge', turns, bonus, fresh: true });
         say(c, `${name}: you move like the wind for ${turns} turns.`, 'blue');
-        if (r >= 5) c.pg = Math.max(c.pg, 100);
+        if (r >= 5) c.pg = Math.max(c.pg, c.eg + 1, 100);
         break;
       }
       case 'ultra_strength': {

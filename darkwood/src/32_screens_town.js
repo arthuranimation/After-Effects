@@ -92,7 +92,7 @@
         }
         const label = hs.label || (place ? place.label : hs.id.toUpperCase());
         const lw = F.measure(label) + 6;
-        const lx = Math.round(hs.x + hs.w / 2 - lw / 2), ly = top + hs.y + hs.h - 12;
+        const lx = Math.round(hs.x + hs.w / 2 - lw / 2), ly = Math.max(top + 2, top + hs.y + (hs.id === 'gate' ? -6 : hs.h - 12));
         G.dither(lx, ly, lw, 10, null, '#000', pressed ? 14 : 10);
         F.draw(label, lx + 3, ly + 2, pressed ? '#fff' : hs.id === 'arena' ? '#fd5' : '#ddc', { shadow: true });
       }

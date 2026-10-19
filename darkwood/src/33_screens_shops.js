@@ -35,17 +35,19 @@
     return out;
   };
 
-  // Detail panel with title, wrapped text and an action button. Returns true when the button is tapped.
+  // Detail panel: title, description, a note line and an action button.
+  // The note wraps beside the button so the button never covers it.
   App.detail = (x, y, w, h, title, text, extra, btn) => {
     UI.panel(x, y, w, h, 'stone');
     F.draw(title, x + 8, y + 7, P.c.gold, { shadow: true });
-    const bw = btn ? 74 : 0;
-    const lines = F.wrap(text, w - 16 - (btn ? 0 : 0));
-    let cy = y + 19;
-    lines.slice(0, 3).forEach(ln => { F.draw(ln, x + 8, cy, P.c.text, { shadow: true }); cy += 10; });
-    if (extra) F.draw(extra, x + 8, y + h - 16, P.c.dim, { shadow: true });
+    const bw = btn ? 78 : 0;
+    const noteLines = extra ? F.wrap(extra, w - 20 - bw).slice(0, 2) : [];
+    const descRoom = Math.max(1, Math.floor((h - 20 - 6 - Math.max(noteLines.length * 10, btn ? 24 : 0)) / 10));
+    const lines = F.wrap(text, w - 16);
+    lines.slice(0, descRoom).forEach((ln, i) => F.draw(i === descRoom - 1 && lines.length > descRoom ? F.fit(ln + ' …', w - 16) : ln, x + 8, y + 19 + i * 10, P.c.text, { shadow: true }));
+    noteLines.forEach((ln, i) => F.draw(ln, x + 8, y + h - 6 - noteLines.length * 10 + i * 10, P.c.dim, { shadow: true }));
     if (!btn) return false;
-    return UI.button('detail-btn', x + w - bw - 6, y + h - 26, bw, 20, btn.label, { theme: btn.theme || 'gold', disabled: btn.disabled, sound: false, key: 'Enter' });
+    return UI.button('detail-btn', x + w - bw - 6, y + h - 28, bw, 22, btn.label, { theme: btn.theme || 'gold', disabled: btn.disabled, sound: false, key: 'Enter' });
   };
 
   const traitLabel = w => {
@@ -79,7 +81,7 @@
     },
     draw() {
       const w = G.w, h = G.h;
-      const top = App.header('smithy', 'WEAPON SMITH', 96);
+      const top = App.header('smithy', 'WEAPON SMITH', h < 440 ? 70 : 96);
       const detH = 86;
       const b = Gm.damageBonus();
       const rows = D.WEAPONS.map(wp => {
@@ -89,7 +91,7 @@
         return {
           icon: A.icon('w_' + wp.look), name: wp.name, nameCol: eq ? P.c.gold : undefined,
           line2: `${wp.damage_min + b}-${wp.damage_max + b} dmg  SPD ${sign(wp.speed)}  ${traitLabel(wp)}`,
-          right: eq ? '' : wp.cost === 0 ? 'free' : U.fmt(price) + 'g', rightCol: afford ? P.c.gold : P.c.redDim,
+          right: eq ? '' : price < 0 ? `+${U.fmt(-price)}g` : price === 0 ? 'free' : U.fmt(price) + 'g', rightCol: price < 0 ? P.c.green : afford ? P.c.gold : P.c.redDim,
           badge: eq ? 'EQUIPPED' : '', badgeCol: P.c.gold,
         };
       });
@@ -102,9 +104,9 @@
         (Gm.tradeIn(cur.cost) ? `  · trade-in ${Gm.tradeIn(cur.cost)}g` : '');
       const price = Gm.weaponPrice(wp);
       if (App.detail(4, h - detH - 4, w - 8, detH, wp.name, wp.description, cmp,
-        { label: eq ? 'OWNED' : `BUY ${U.fmt(price)}`, disabled: eq, theme: S.p.gold >= price ? 'gold' : 'stone' })) {
+        { label: eq ? 'OWNED' : price < 0 ? 'SWAP' : `BUY ${U.fmt(price)}`, disabled: eq, theme: S.p.gold >= price ? 'gold' : 'stone' })) {
         if (wp.cost < cur.cost && S.p.gold >= price) {
-          App.confirm('TRADE DOWN?', `The smith will take your ${cur.name} in part exchange for the cheaper ${wp.name}. Are you sure?`, () => buyFx(Gm.buyWeapon(wp.name)), 'TRADE');
+          App.confirm('TRADE DOWN?', `The smith takes your ${cur.name} in part exchange for the cheaper ${wp.name}${price < 0 ? ` and pays you ${-price} gold` : ''}. Are you sure?`, () => buyFx(Gm.buyWeapon(wp.name)), 'TRADE');
         } else buyFx(Gm.buyWeapon(wp.name));
       }
       App.drawHud();
@@ -136,9 +138,16 @@
     enter() { App.music('town'); aSel = 0; UI.scrollReset('alist'); },
     draw() {
       const w = G.w, h = G.h;
-      const top = App.header('apothecary', 'APOTHECARY', 96);
-      const nt = UI.tabs('atabs', 4, top + 2, w - 8, 20, TABS.map(t => t.label), aTab);
-      if (nt !== aTab) { aTab = nt; aSel = 0; UI.scrollReset('alist'); }
+      const top = App.header('apothecary', 'APOTHECARY', h < 440 ? 70 : 96);
+      const nt = UI.tabs('atabs', 4, top + 2, w - 8, 22, TABS.map(t => t.label), aTab);
+      if (nt !== aTab) {
+        aTab = nt; UI.scrollReset('alist');
+        // open on the first upgrade (or what you wear), never on a downgrade
+        const list = D.ITEMS.filter(i => TABS[aTab].types.includes(i.type));
+        const eq = list.findIndex(i => Gm.itemStatus(i) === 'equipped');
+        const up = list.findIndex(i => !Gm.itemStatus(i) && !Gm.isDowngrade(i));
+        aSel = Math.max(0, up >= 0 ? up : eq);
+      }
       const items = D.ITEMS.filter(i => TABS[aTab].types.includes(i.type));
       const detH = 86;
       const rows = items.map(it => {
@@ -151,12 +160,12 @@
         else if (it.type === 'wand' && S.p.wands[it.name]) badge = `${S.p.wands[it.name]} charges`;
         return {
           icon: A.icon(it.icon), name: it.name, nameCol: st ? P.c.gold : undefined, line2: itemLine(it),
-          right: st ? '' : U.fmt(price) + 'g', rightCol: S.p.gold >= price ? P.c.gold : P.c.redDim,
+          right: st ? '' : price < 0 ? `+${U.fmt(-price)}g` : U.fmt(price) + 'g', rightCol: price < 0 ? P.c.green : S.p.gold >= price ? P.c.gold : P.c.redDim,
           badge, badgeCol: st ? P.c.gold : P.c.green, dim: st === 'read',
         };
       });
       aSel = Math.min(aSel, items.length - 1);
-      aSel = App.list('alist', rows, aSel, 4, top + 25, w - 8, h - top - 25 - detH - 8);
+      aSel = App.list('alist', rows, aSel, 4, top + 27, w - 8, h - top - 27 - detH - 8);
       const it = items[aSel];
       const st = Gm.itemStatus(it);
       const price = Gm.itemPrice(it);
@@ -170,8 +179,11 @@
         extra = `Charges carried: ${S.p.wands[it.name] || 0}. Buying adds ${it.charges}.`;
       }
       if (App.detail(4, h - detH - 4, w - 8, detH, it.name, it.description, extra,
-        { label: st ? (st === 'read' ? 'STUDIED' : 'OWNED') : `BUY ${U.fmt(price)}`, disabled: !!st, theme: S.p.gold >= price ? 'gold' : 'stone' })) {
-        buyFx(Gm.buyItem(it.name));
+        { label: st ? (st === 'read' ? 'STUDIED' : 'OWNED') : price < 0 ? 'SWAP' : `BUY ${U.fmt(price)}`, disabled: !!st, theme: S.p.gold >= price ? 'gold' : 'stone' })) {
+        if (Gm.isDowngrade(it) && S.p.gold >= price) {
+          const cur = it.type === 'armor' ? Gm.armorData() : Gm.ringData();
+          App.confirm('TRADE DOWN?', `Swap your ${cur.name} for the weaker ${it.name}${price < 0 ? ` and get ${-price} gold back` : ''}?`, () => buyFx(Gm.buyItem(it.name)), 'SWAP');
+        } else buyFx(Gm.buyItem(it.name));
       }
       App.drawHud();
     },
@@ -193,7 +205,7 @@
     enter() { App.music('town'); rumor = U.rand(0, D.RUMORS.length - 1); },
     draw() {
       const w = G.w, h = G.h, p = S.p;
-      const top = App.header('inn', 'THE RUSTY FLAGON', 96);
+      const top = App.header('inn', 'THE RUSTY FLAGON', h < 440 ? 70 : Math.min(150, h - 400 + 96));
       let y = top + 4;
       // rumour board
       const rumH = 64;
