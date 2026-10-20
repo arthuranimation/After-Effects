@@ -240,9 +240,11 @@
         else { App.sfx('deny'); UI.toast(r.msg, P.c.dim); }
       }
       y += 36;
-      if (UI.button('inn-listen', 4, y, bw, 24, 'LISTEN TO THE ROOM', { theme: 'stone' })) {
+      const hw = Math.floor((bw - 4) / 2);
+      if (UI.button('inn-listen', 4, y, hw, 28, 'LISTEN', { theme: 'stone', sub: 'to the room' })) {
         rumor = (rumor + 1 + U.rand(0, D.RUMORS.length - 2)) % D.RUMORS.length;
       }
+      if (UI.button('inn-dice', 8 + hw, y, hw, 28, 'BONE DICE', { theme: 'red', sub: 'a stranger’s game' })) App.go('dice');
       App.drawHud();
     },
   });

@@ -36,36 +36,57 @@
     { name: 'The Iron Ring',      short: 'III', blurb: 'Monsters the city pays dearly to keep chained. The crowd goes quiet.' },
     { name: "The Champion's Crown", short: 'IV', blurb: 'Giants, demons, and the dragon. Win here and the city is yours.' },
   ];
-  D.TIER_UNLOCK = 3;          // defeat this many in a ring to open the next
+  D.TIER_UNLOCK = 4;          // defeat this many in a ring to open the next
   D.FINAL_BOSS = 'Red Dragon'; // unlocked once every other foe in its ring is beaten
 
-  const M = (L, H, R, extra = {}) => Object.assign({ L, H, R, feint: 0, combo: 0 }, extra);
+  // ---------------------------------------------------------------
+  // ATTACK MOVES — every enemy mixes these in its own proportions.
+  //   time: wind-up length (× the enemy's base)   dmg: damage multiplier
+  //   tempo: how the wind-up unfolds — steady (even), rush (creeps, then
+  //          snaps forward), stutter (stops mid-swing to bait an early parry)
+  //   hits: strikes in a row    dir: forced direction (0 = overhead)
+  //   noParry: can be blocked but never parried
+  // ---------------------------------------------------------------
+  D.MOVES = {
+    strike: { name: 'Strike',        tempo: 'steady',  time: 1.0,  dmg: 1.0 },
+    jab:    { name: 'Quick Jab',     tempo: 'steady',  time: 0.6,  dmg: 0.65 },
+    heavy:  { name: 'Heavy Blow',    tempo: 'steady',  time: 1.45, dmg: 1.55 },
+    lunge:  { name: 'Lunge',         tempo: 'rush',    time: 1.05, dmg: 1.15 },
+    delay:  { name: 'Delayed Swing', tempo: 'stutter', time: 1.3,  dmg: 1.2 },
+    flurry: { name: 'Flurry',        tempo: 'steady',  time: 0.55, dmg: 0.55, hits: 3 },
+    breath: { name: 'Fire Breath',   tempo: 'rush',    time: 1.35, dmg: 1.35, dir: 0, noParry: true },
+  };
+
+  // moves: weights for left / high / right, feint (the tell switches sides
+  // mid wind-up), combo (a quick second strike), style (move weights) and
+  // names (what this creature calls each move).
+  const M = (L, H, R, extra = {}) => Object.assign({ L, H, R, feint: 0, combo: 0, style: { strike: 1 }, names: {} }, extra);
 
   D.ENEMIES = [
     // ---- I: The Pit ----
-    { name: 'Giant Rat',  tier: 1, hp: 14,  damage_min: 1,  damage_max: 4,  armor: 0,  speed: 9,  xp: 60,   gold: 12,   kind: 'beast',    special: 'none',    moves: M(1, 1, 1),            description: 'A bloated sewer rat the size of a dog. Its bite festers.' },
-    { name: 'Kobold',     tier: 1, hp: 18,  damage_min: 2,  damage_max: 4,  armor: 1,  speed: 8,  xp: 90,   gold: 18,   kind: 'humanoid', special: 'none',    moves: M(2, 1, 2),            description: 'A small reptilian creature with a cruel cunning and a rusty blade.' },
-    { name: 'Goblin',     tier: 1, hp: 24,  damage_min: 2,  damage_max: 6,  armor: 1,  speed: 9,  xp: 130,  gold: 26,   kind: 'humanoid', special: 'none',    moves: M(2, 1, 2),            description: 'Cackling and vicious. Travels in packs but fights alone.' },
-    { name: 'Skeleton',   tier: 1, hp: 28,  damage_min: 3,  damage_max: 6,  armor: 3,  speed: 6,  xp: 170,  gold: 32,   kind: 'undead',   special: 'none',    moves: M(1, 2, 1),            description: 'Held together by dark magic. Feels no pain or mercy. Blades skitter off its bones.' },
-    { name: 'Orc',        tier: 1, hp: 36,  damage_min: 3,  damage_max: 8,  armor: 2,  speed: 7,  xp: 220,  gold: 45,   kind: 'humanoid', special: 'none',    moves: M(1, 2, 1),            description: 'Scarred and brutal. Lives for the thrill of combat.' },
+    { name: 'Giant Rat',  tier: 1, hp: 14, damage_min: 1, damage_max: 4,  armor: 0,  speed: 9,  xp: 60,   gold: 12,   kind: 'beast',    special: 'none',    moves: M(1, 1, 1, { style: { strike: 3, jab: 2, lunge: 1 }, names: { strike: 'Bite', jab: 'Nip', lunge: 'Pounce' } }),            description: 'A bloated sewer rat the size of a dog. Its bite festers.' },
+    { name: 'Kobold',     tier: 1, hp: 18, damage_min: 2, damage_max: 4,  armor: 1,  speed: 8,  xp: 90,   gold: 18,   kind: 'humanoid', special: 'none',    moves: M(2, 1, 2, { style: { strike: 3, jab: 2, delay: 1 }, names: { strike: 'Stab', jab: 'Jab', delay: 'Sneaky Stab' } }),            description: 'A small reptilian creature with a cruel cunning and a rusty blade.' },
+    { name: 'Goblin',     tier: 1, hp: 24, damage_min: 2, damage_max: 6,  armor: 1,  speed: 9,  xp: 130,  gold: 26,   kind: 'humanoid', special: 'none',    moves: M(2, 1, 2, { style: { strike: 3, lunge: 1, delay: 1 }, names: { strike: 'Club', lunge: 'Mad Rush', delay: 'Cackling Feint' } }),            description: 'Cackling and vicious. Travels in packs but fights alone.' },
+    { name: 'Skeleton',   tier: 1, hp: 28, damage_min: 3, damage_max: 6,  armor: 3,  speed: 6,  xp: 170,  gold: 32,   kind: 'undead',   special: 'none',    moves: M(1, 2, 1, { style: { strike: 3, heavy: 1 }, names: { strike: 'Slash', heavy: 'Overhead Chop' } }),            description: 'Held together by dark magic. Feels no pain or mercy. Blades skitter off its bones.' },
+    { name: 'Orc',        tier: 1, hp: 36, damage_min: 3, damage_max: 8,  armor: 2,  speed: 7,  xp: 220,  gold: 45,   kind: 'humanoid', special: 'none',    moves: M(1, 2, 1, { style: { strike: 2, heavy: 2, lunge: 1 }, names: { strike: 'Cleave', heavy: 'Brutal Cleave', lunge: 'Charge' } }),            description: 'Scarred and brutal. Lives for the thrill of combat.' },
     // ---- II: The Blood Sands ----
-    { name: 'Gnoll',      tier: 2, hp: 44,  damage_min: 5, damage_max: 11,  armor: 2,  speed: 8,  xp: 320,  gold: 58,   kind: 'beast',    special: 'none',    moves: M(2, 1, 2, { combo: 0.15 }), description: 'A hyena-headed marauder with a taste for carrion.' },
-    { name: 'Hobgoblin',  tier: 2, hp: 50,  damage_min: 6, damage_max: 12, armor: 3,  speed: 7,  xp: 420,  gold: 75,   kind: 'humanoid', special: 'none',    moves: M(2, 1, 2, { feint: 0.15 }), description: 'Disciplined and dangerous. A veteran of a hundred skirmishes.' },
-    { name: 'Ghoul',      tier: 2, hp: 58,  damage_min: 6, damage_max: 12, armor: 1,  speed: 9,  xp: 480,  gold: 85,   kind: 'undead',   special: 'drain',   moves: M(2, 1, 2),            description: "Its cold touch doesn't just wound — it steals your very experience." },
-    { name: 'Bugbear',    tier: 2, hp: 66,  damage_min: 7, damage_max: 14, armor: 3,  speed: 6,  xp: 600,  gold: 100,  kind: 'humanoid', special: 'none',    moves: M(1, 2, 1),            description: 'Massive and silent. Strikes before you even hear it coming.' },
-    { name: 'Wight',      tier: 2, hp: 72,  damage_min: 8, damage_max: 14, armor: 4,  speed: 7,  xp: 700,  gold: 120,  kind: 'undead',   special: 'drain',   moves: M(1, 1, 1, { feint: 0.15 }), description: 'A wraith of hunger. Each blow drains the life from your soul.' },
+    { name: 'Gnoll',      tier: 2, hp: 46, damage_min: 6, damage_max: 14,  armor: 2,  speed: 8,  xp: 320,  gold: 58,   kind: 'beast',    special: 'none',    moves: M(2, 1, 2, { combo: 0.15, style: { strike: 2, flurry: 1, lunge: 1 }, names: { strike: 'Flail', flurry: 'Frenzy', lunge: 'Leap' } }), description: 'A hyena-headed marauder with a taste for carrion.' },
+    { name: 'Hobgoblin',  tier: 2, hp: 52, damage_min: 8, damage_max: 15, armor: 3,  speed: 7,  xp: 420,  gold: 75,   kind: 'humanoid', special: 'none',    moves: M(2, 1, 2, { feint: 0.15, style: { strike: 2, jab: 1, delay: 2 }, names: { strike: 'Scimitar Cut', jab: 'Pommel Strike', delay: 'Feinting Cut' } }), description: 'Disciplined and dangerous. A veteran of a hundred skirmishes.' },
+    { name: 'Ghoul',      tier: 2, hp: 61, damage_min: 8, damage_max: 15, armor: 1,  speed: 9,  xp: 480,  gold: 85,   kind: 'undead',   special: 'drain',   moves: M(2, 1, 2, { style: { strike: 2, flurry: 2, lunge: 1 }, names: { strike: 'Claw', flurry: 'Rake', lunge: 'Lunge' } }),            description: "Its cold touch doesn't just wound — it steals your very experience." },
+    { name: 'Bugbear',    tier: 2, hp: 69, damage_min: 9, damage_max: 18, armor: 3,  speed: 6,  xp: 600,  gold: 100,  kind: 'humanoid', special: 'none',    moves: M(1, 2, 1, { style: { strike: 2, heavy: 2, delay: 1 }, names: { strike: 'Morningstar', heavy: 'Crushing Blow', delay: 'Silent Strike' } }),            description: 'Massive and silent. Strikes before you even hear it coming.' },
+    { name: 'Wight',      tier: 2, hp: 76, damage_min: 10, damage_max: 18, armor: 4,  speed: 7,  xp: 700,  gold: 120,  kind: 'undead',   special: 'drain',   moves: M(1, 1, 1, { feint: 0.15, style: { strike: 2, delay: 2, heavy: 1 }, names: { strike: 'Grave Cut', delay: 'Hungry Pause', heavy: 'Barrow Blow' } }), description: 'A wraith of hunger. Each blow drains the life from your soul.' },
     // ---- III: The Iron Ring ----
-    { name: 'Ogre',       tier: 3, hp: 110, damage_min: 10, damage_max: 19, armor: 3,  speed: 5,  xp: 950,  gold: 160,  kind: 'giant',    special: 'none',    moves: M(1, 3, 1),            description: 'Enormous and stupid. Its fists hit like falling stones.' },
-    { name: 'Troll',      tier: 3, hp: 120, damage_min: 9, damage_max: 16, armor: 3,  speed: 6,  xp: 1150, gold: 190,  kind: 'giant',    special: 'regen',   moves: M(2, 1, 2, { combo: 0.2 }),  description: 'Wounds close before your eyes. Only persistent assault — or fire — will finish it.' },
-    { name: 'Basilisk',   tier: 3, hp: 130, damage_min: 10, damage_max: 17, armor: 6,  speed: 6,  xp: 1350, gold: 230,  kind: 'beast',    special: 'petrify', moves: M(2, 1, 2, { feint: 0.2 }),  description: 'Its gaze can lock your muscles mid-swing. Avert your eyes.' },
-    { name: 'Werewolf',   tier: 3, hp: 115, damage_min: 11, damage_max: 19, armor: 3,  speed: 12, xp: 1500, gold: 260,  kind: 'beast',    special: 'none',    moves: M(2, 1, 2, { combo: 0.35 }), description: 'Faster and fiercer than anything natural. Strikes in a blur of claws.' },
-    { name: 'Vampire',    tier: 3, hp: 145, damage_min: 13, damage_max: 21, armor: 4,  speed: 11, xp: 1800, gold: 330,  kind: 'undead',   special: 'drain',   moves: M(2, 1, 2, { feint: 0.3 }),  description: 'Aristocratic and lethal. Drains your hard-won experience with each touch.' },
+    { name: 'Ogre',       tier: 3, hp: 132, damage_min: 15, damage_max: 28, armor: 3,  speed: 5,  xp: 950,  gold: 160,  kind: 'giant',    special: 'none',    moves: M(1, 3, 1, { style: { heavy: 3, strike: 1, lunge: 1 }, names: { heavy: 'Hammer Fist', strike: 'Punch', lunge: 'Belly Charge' } }),            description: 'Enormous and stupid. Its fists hit like falling stones.' },
+    { name: 'Troll',      tier: 3, hp: 144, damage_min: 14, damage_max: 24, armor: 3,  speed: 6,  xp: 1150, gold: 190,  kind: 'giant',    special: 'regen',   moves: M(2, 1, 2, { combo: 0.2, style: { strike: 2, flurry: 2, lunge: 1 }, names: { strike: 'Claw', flurry: 'Rending Claws', lunge: 'Lunge' } }),  description: 'Wounds close before your eyes. Only persistent assault — or fire — will finish it.' },
+    { name: 'Basilisk',   tier: 3, hp: 156, damage_min: 15, damage_max: 26, armor: 6,  speed: 6,  xp: 1350, gold: 230,  kind: 'beast',    special: 'petrify', moves: M(2, 1, 2, { feint: 0.2, style: { strike: 2, delay: 2, lunge: 1 }, names: { strike: 'Bite', delay: 'Petrifying Gaze', lunge: 'Strike' } }),  description: 'Its gaze can lock your muscles mid-swing. Avert your eyes.' },
+    { name: 'Werewolf',   tier: 3, hp: 138, damage_min: 16, damage_max: 28, armor: 3,  speed: 12, xp: 1500, gold: 260,  kind: 'beast',    special: 'none',    moves: M(2, 1, 2, { combo: 0.35, style: { flurry: 2, jab: 2, lunge: 2 }, names: { flurry: 'Frenzy', jab: 'Snap', lunge: 'Pounce' } }), description: 'Faster and fiercer than anything natural. Strikes in a blur of claws.' },
+    { name: 'Vampire',    tier: 3, hp: 174, damage_min: 20, damage_max: 32, armor: 4,  speed: 11, xp: 1800, gold: 330,  kind: 'undead',   special: 'drain',   moves: M(2, 1, 2, { feint: 0.3, style: { delay: 2, lunge: 2, strike: 1 }, names: { delay: 'Mesmerize', lunge: 'Blood Lunge', strike: 'Claw' } }),  description: 'Aristocratic and lethal. Drains your hard-won experience with each touch.' },
     // ---- IV: The Champion's Crown ----
-    { name: 'Hill Giant', tier: 4, hp: 190, damage_min: 17, damage_max: 28, armor: 4,  speed: 4,  xp: 2400, gold: 450,  kind: 'giant',    special: 'none',    moves: M(1, 3, 1),            description: 'It wields an oak tree as a club. The ground shakes when it walks.' },
-    { name: 'Fire Giant', tier: 4, hp: 215, damage_min: 17, damage_max: 29, armor: 5,  speed: 5,  xp: 3000, gold: 600,  kind: 'giant',    special: 'fire',    moves: M(1, 2, 1, { combo: 0.15 }), description: 'Wreathed in flame. Your armour is little protection from the heat.' },
-    { name: 'Lich',       tier: 4, hp: 190, damage_min: 16, damage_max: 27, armor: 4,  speed: 8,  xp: 3600, gold: 750,  kind: 'undead',   special: 'drain',   moves: M(1, 1, 1, { feint: 0.3 }), description: 'An ancient sorcerer who cheated death. Its power is immeasurable.' },
-    { name: 'Demon',      tier: 4, hp: 225, damage_min: 18, damage_max: 30, armor: 5,  speed: 9,  xp: 4500, gold: 900,  kind: 'fiend',    special: 'none',    moves: M(2, 1, 2, { combo: 0.15, feint: 0.15 }), description: 'Summoned from the abyss. It exists only to destroy.' },
-    { name: 'Red Dragon', tier: 4, hp: 340, damage_min: 24, damage_max: 40, armor: 6,  speed: 9,  xp: 8000, gold: 2000, kind: 'dragon',   special: 'fire',    moves: M(2, 2, 2, { combo: 0.2, feint: 0.2 }),  description: 'The apex predator. Captain of the Guard or ashes — choose wisely.' },
+    { name: 'Hill Giant', tier: 4, hp: 238, damage_min: 30, damage_max: 49, armor: 4,  speed: 4,  xp: 2400, gold: 450,  kind: 'giant',    special: 'none',    moves: M(1, 3, 1, { style: { heavy: 3, strike: 1, delay: 1 }, names: { heavy: 'Oak Smash', strike: 'Swat', delay: 'Wind-up Smash' } }),            description: 'It wields an oak tree as a club. The ground shakes when it walks.' },
+    { name: 'Fire Giant', tier: 4, hp: 269, damage_min: 30, damage_max: 51, armor: 5,  speed: 5,  xp: 3000, gold: 600,  kind: 'giant',    special: 'fire',    moves: M(1, 2, 1, { combo: 0.15, style: { strike: 2, heavy: 2, breath: 1 }, names: { strike: 'Flaming Sword', heavy: 'Molten Cleave' } }), description: 'Wreathed in flame. Your armour is little protection from the heat.' },
+    { name: 'Lich',       tier: 4, hp: 238, damage_min: 28, damage_max: 47, armor: 4,  speed: 8,  xp: 3600, gold: 750,  kind: 'undead',   special: 'drain',   moves: M(1, 1, 1, { feint: 0.3, style: { delay: 2, lunge: 2, strike: 1 }, names: { delay: 'Necrotic Pause', lunge: 'Soul Bolt', strike: 'Staff Strike' } }), description: 'An ancient sorcerer who cheated death. Its power is immeasurable.' },
+    { name: 'Demon',      tier: 4, hp: 281, damage_min: 32, damage_max: 52, armor: 5,  speed: 9,  xp: 4500, gold: 900,  kind: 'fiend',    special: 'none',    moves: M(2, 1, 2, { combo: 0.15, feint: 0.15, style: { flurry: 2, heavy: 1, lunge: 1, delay: 1 }, names: { flurry: 'Claw Storm', heavy: 'Hellfire Smash', delay: 'Deceit' } }), description: 'Summoned from the abyss. It exists only to destroy.' },
+    { name: 'Red Dragon', tier: 4, hp: 350, damage_min: 33, damage_max: 56, armor: 6,  speed: 9,  xp: 8000, gold: 2000, kind: 'dragon',   special: 'fire',    moves: M(2, 2, 2, { combo: 0.2, feint: 0.2, style: { strike: 2, breath: 2, lunge: 1, heavy: 1, flurry: 1 }, names: { strike: 'Claw', heavy: 'Tail Crush', flurry: 'Rending Claws' } }),  description: 'The apex predator. Captain of the Guard or ashes — choose wisely.' },
   ];
 
   D.ITEMS = [

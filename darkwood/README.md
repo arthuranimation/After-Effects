@@ -11,25 +11,34 @@ saves from Darkwood 8.0 are migrated.
 ## How to play
 
 - **Town:** tap a building, or use the buttons below the scene.
-  - **Arena:** four rings of five foes each. Beat 3 foes in a ring to open the
-    next ring. The Red Dragon waits at the top of the last ring.
+  - **Arena:** four rings of five foes each. Beat 4 foes in a ring to open the
+    next ring. Each ring hits much harder than the last, so you will need
+    armour. The Red Dragon waits at the top of the last ring.
   - **Smithy:** weapons trade damage against speed, and some have traits:
     *Crush* ignores armour, *Crit* lands more critical hits, *Holy* deals
     extra damage to undead and fiends. Your old weapon is traded in for 30%.
   - **Apothecary:** potions, mana draughts, armour, rings, tomes and wands.
   - **The Rusty Flagon:** rent a room to fully rest, or sleep in the stables
     for free (half health). Strangers may offer you a paid oath to kill a foe.
+    A pale stranger plays **Bone Dice**: roll three, hold any, re-roll once.
+    Skulls stay where they fall. Three skulls pays ×12, three crowns ×8, any
+    other triple ×3, two crowns ×1.5, and a pair returns your stake.
 - **Combat:** the turn strip shows who acts next; faster fighters act more often.
   - **Your turn:** Attack, use Skills (MP), use Items, or Flee.
   - **Blocking:** when a monster winds up, watch which side it raises its
-    weapon or claw on and block that side (`◀ LEFT`, `▲ HIGH`, `RIGHT ▶`).
-    You can tap the button, swipe on the stage, or use the arrow keys.
-    A block cuts the damage by 80% and gives you 1 MP.
+    weapon or claw on and guard that side: tap the battle **left of your hero,
+    above your hero, or right of your hero** (the left, middle and right
+    thirds of the screen), or use the arrow keys. A block cuts the damage by
+    80% and gives you 1 MP.
   - **Parrying:** block at the last moment, when the glint flashes and the
-    timer reaches the gold zone. A parry stops all the damage, gives you 2 MP
-    and lets you act sooner.
-  - **Tricks:** some foes *feint* (switch sides mid wind-up) or *strike twice*.
-    A dragon's breath can be blocked but not parried.
+    timing bar above your hero reaches the gold zone. A parry stops all the
+    damage, gives you 2 MP and lets you act sooner.
+  - **Attack styles:** every monster has its own moves, named as they wind up.
+    *Lunges* creep, then snap forward (the bar speeds up). *Delayed* swings stop
+    halfway to bait an early parry. *Heavy* blows are slow and hurt.
+    *Flurries* are three quick strikes. *Jabs* are fast and light. Some foes
+    *feint* (switch sides mid wind-up), and fire breath can be blocked but
+    never parried.
 - **Levelling:** each level gives a little HP and MP automatically, plus a
   choice:
   - **Vitality:** more max HP.
@@ -40,8 +49,8 @@ saves from Darkwood 8.0 are migrated.
   screen.
 - **Rematches:** after a win, *Fight Again* brings the foe back with an extra
   life for more gold.
-- **Block Assist** (in Options) slows down wind-ups and highlights the right
-  side to block. Use it if the timing is too tight.
+- **Block Assist** (in Options) slows down wind-ups, widens the parry window
+  and shows an arrow on the attacking side. Use it if the timing is too tight.
 
 ## Changes since 8.0
 

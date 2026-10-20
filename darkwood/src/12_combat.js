@@ -207,7 +207,7 @@
         endEnemyTurn(c);
         return { type: 'skip', who: 'enemy' };
       }
-      c.pending = makeAttack(c, false);
+      c.pending = makeAttack(c);
       return { type: 'enemy', attack: c.pending };
     }
 
@@ -245,21 +245,49 @@
     return Math.round(ms);
   };
 
-  const makeAttack = (c, isCombo, prevDir) => {
+  const pickMove = style => {
+    const keys = Object.keys(style || {}).filter(k => D.MOVES[k]);
+    if (!keys.length) return 'strike';
+    let r = Math.random() * keys.reduce((t, k) => t + style[k], 0);
+    for (const k of keys) { r -= style[k]; if (r < 0) return k; }
+    return keys[0];
+  };
+
+  // follow: continue a flurry or combo ({ move, hitsLeft, prevDir }).
+  const makeAttack = (c, follow) => {
     const m = c.enemy.moves;
-    const dir = pickDir(m, isCombo ? prevDir : undefined);
-    let windup = C.windupMs(c);
-    if (isCombo) windup = Math.round(windup * 0.6);
-    const parry = Math.round(Math.max(200, windup * 0.28) * (S.settings.assist ? 1.3 : 1));
-    const a = { dir, windup, parry, isCombo, combo: false, feintAt: 0, feintDir: dir, breath: false };
-    if (!isCombo && Math.random() < (m.combo || 0)) a.combo = true;
-    if (!isCombo && Math.random() < (m.feint || 0)) {
+    const key = follow ? follow.move : pickMove(m.style);
+    const mv = D.MOVES[key] || D.MOVES.strike;
+    const hitsLeft = follow ? follow.hitsLeft : mv.hits || 1;
+    const dir = mv.dir !== undefined ? mv.dir : pickDir(m, follow ? follow.prevDir : undefined);
+    // a little jitter so no two wind-ups are timed exactly alike
+    const windup = Math.round(C.windupMs(c) * mv.time * (0.9 + Math.random() * 0.2));
+    const parry = mv.noParry ? 0 : Math.round(Math.max(180, windup * 0.26) * (S.settings.assist ? 1.3 : 1));
+    const a = {
+      move: key, name: (m.names && m.names[key]) || mv.name, tempo: mv.tempo || 'steady',
+      dir, windup, parry, dmgMul: mv.dmg, noParry: !!mv.noParry, breath: key === 'breath',
+      hitsLeft, isCombo: !!follow, combo: false, feintAt: 0, feintDir: dir,
+    };
+    if (!follow && hitsLeft === 1 && Math.random() < (m.combo || 0)) a.combo = true;
+    if (!follow && mv.dir === undefined && Math.random() < (m.feint || 0)) {
       a.feintAt = Math.round(windup * 0.45);
       a.feintDir = pickDir(m, dir);
     }
     a.final = a.feintAt ? a.feintDir : dir;
-    a.breath = c.enemy.special === 'fire' && a.final === 0 && (c.enemy.kind === 'dragon' || Math.random() < 0.5);
     return a;
+  };
+
+  // How far through its wind-up an attack looks at time fraction f (0..1).
+  // The timing bar and the monster's pose both follow this curve.
+  C.tempo = (tempo, f) => {
+    f = U.clamp(f, 0, 1);
+    if (tempo === 'rush') return Math.pow(f, 2.3);                     // creeps, then snaps
+    if (tempo === 'stutter') {                                          // stops mid-swing
+      if (f < 0.4) return f / 0.4 * 0.55;
+      if (f < 0.68) return 0.55;
+      return 0.55 + (f - 0.68) / 0.32 * 0.45;
+    }
+    return f;
   };
 
   // guardDir: -1/0/1 or null (never blocked). guardMs: ms before the strike
@@ -272,13 +300,15 @@
     const e = c.enemy, p = S.p;
     const dir = a.final;
     const blocked = guardDir !== null && guardDir !== undefined && guardDir === dir;
-    const parried = blocked && guardMs <= a.parry && !a.breath;
+    const parried = blocked && guardMs <= a.parry && !a.noParry;
 
     const roll = U.rand(e.damage_min, e.damage_max);
     const def = Gm.defense();
-    let dmg = Math.max(1, roll - (e.special === 'fire' ? Math.floor(def / 4) : Math.floor(def / 2)));
+    // armour soaks a share of every blow: 20 / (20 + defense). Fire ignores half of it.
+    const soak = 20 / (20 + def * (e.special === 'fire' ? 0.5 : 1));
+    let dmg = Math.max(1, Math.round(roll * (a.dmgMul || 1) * soak));
     if (st(c.pst, 'exhaust')) dmg = Math.round(dmg * 1.25);
-    const what = a.breath ? 'breathes fire on you' : 'strikes you';
+    const what = a.breath ? ' breathes fire on you' : `'s ${a.name} hits you`;
 
     const rip = st(c.pst, 'riposte');
     if (parried) {
@@ -297,7 +327,7 @@
       ev(c, { t: 'pDamage', dmg, blocked: true, parried: false, dir });
       if (hurtPlayer(c, dmg)) return {};
     } else {
-      say(c, `The ${e.name} ${what} for ${dmg}${guardDir !== null && guardDir !== undefined ? ' — wrong side!' : '.'}`, 'red');
+      say(c, `The ${e.name}${what} for ${dmg}${guardDir !== null && guardDir !== undefined ? ' — wrong side!' : '.'}`, 'red');
       ev(c, { t: 'pDamage', dmg, blocked: false, parried: false, dir, breath: a.breath });
       if (hurtPlayer(c, dmg)) return {};
       if (e.special === 'drain' && Math.random() < 0.3 && p.xp > 0) {
@@ -327,8 +357,10 @@
       }
     }
 
-    if (!c.over && a.combo && !a.isCombo) {
-      c.pending = makeAttack(c, true, dir);
+    if (!c.over && (a.hitsLeft > 1 || a.combo)) {
+      c.pending = a.hitsLeft > 1
+        ? makeAttack(c, { move: a.move, hitsLeft: a.hitsLeft - 1, prevDir: dir })
+        : makeAttack(c, { move: 'jab', hitsLeft: 1, prevDir: dir });
       say(c, `The ${e.name} strikes again!`, 'orange');
       return { combo: c.pending };
     }

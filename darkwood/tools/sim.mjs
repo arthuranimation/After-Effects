@@ -17,6 +17,7 @@ const src = f => fs.readFileSync(path.join(here, '..', 'src', f), 'utf8');
 const SKILLS = {
   novice: { block: 0.55, parry: 0.1, feintPenalty: 0.2 },
   avg: { block: 0.75, parry: 0.3, feintPenalty: 0.15 },
+  assist: { block: 0.68, parry: 0.2, feintPenalty: 0.15 },   // a novice with Block Assist on
   expert: { block: 0.92, parry: 0.55, feintPenalty: 0.08 },
 };
 
@@ -51,7 +52,7 @@ function playGame(DW, skill, log = false) {
     const curW = Gm.weaponData();
     const bestW = D.WEAPONS.filter(w => Gm.weaponPrice(w) <= p().gold - 60 && score(w) > score(curW) * 1.08).sort((a, b) => score(b) - score(a))[0];
     if (bestW) { out.goldSpent += Gm.weaponPrice(bestW); Gm.buyWeapon(bestW.name); }
-    for (const type of ['armor', 'ring']) {
+    for (const type of (process.env.NOARMOR ? [] : ['armor', 'ring'])) {
       const cur = type === 'armor' ? Gm.armorData() : Gm.ringData();
       const best = D.ITEMS.filter(i => i.type === type && i.value > (cur ? cur.value : 0) && Gm.itemPrice(i) <= p().gold - 80).sort((a, b) => b.value - a.value)[0];
       if (best) { out.goldSpent += Gm.itemPrice(best); Gm.buyItem(best.name); }
@@ -103,11 +104,14 @@ function playGame(DW, skill, log = false) {
       } else if (t.type === 'enemy') {
         let a = t.attack;
         for (;;) {
+          // tempo makes some attacks harder to read and much harder to parry
           let pb = skill.block - (a.feintAt ? skill.feintPenalty : 0);
-          if (a.isCombo) pb -= 0.1;
+          if (a.isCombo) pb -= 0.08;
+          if (a.move === 'jab') pb -= 0.05;
+          const pp = skill.parry * (a.tempo === 'stutter' ? 0.45 : a.tempo === 'rush' ? 0.7 : 1);
           const right = Math.random() < pb;
           guardDir = right ? a.final : [-1, 0, 1].filter(d => d !== a.final)[Math.floor(Math.random() * 2)];
-          const ms = right && Math.random() < skill.parry ? a.parry / 2 : a.parry + 200;
+          const ms = right && Math.random() < pp ? a.parry / 2 : a.parry + 200;
           const r = C.resolveAttack(guardDir, ms);
           if (r.combo) { a = r.combo; continue; }
           break;

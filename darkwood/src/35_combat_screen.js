@@ -291,7 +291,11 @@
     st.glinted = false; st.feinted = false;
     st.pose = { f: 0, dir: a.dir, wind: 0.01, strike: 0, hurt: 0 };
     st.hero = st.guard === null ? { act: 'idle', t: 0, dir: 0 } : { act: 'block', t: 0, dir: st.guard };
-    App.sfx('whoosh', { pitch: 0.7, vol: 0.4 });
+    App.sfx('whoosh', { pitch: a.tempo === 'rush' ? 0.55 : 0.7, vol: 0.4 });
+    // name the move over the monster (it says how, not where)
+    const [, ty] = enemyOrigin();
+    const col = a.noParry ? '#fa2' : a.dmgMul >= 1.4 ? '#f65' : a.tempo === 'stutter' ? '#c9f' : a.tempo === 'rush' ? '#fd5' : '#ddc';
+    if (!a.isCombo) FX.number(L.w >> 1, Math.max(L.stageY + 40, ty + 4), a.name + '!', col, { life: 0.9 });
   }
 
   function setGuard(dir) {
@@ -313,9 +317,9 @@
     const dir = a.feintAt && st.wt >= a.feintAt ? a.feintDir : a.dir;
     if (a.feintAt && !st.feinted && st.wt >= a.feintAt) { st.feinted = true; App.sfx('whoosh', { pitch: 0.9, vol: 0.5 }); }
     st.pose.dir = dir;
-    st.pose.wind = Math.min(1, st.wt / (a.windup * 0.6));
+    st.pose.wind = Math.min(1, C.tempo(a.tempo, st.wt / a.windup) / 0.6);
     const remain = a.windup - st.wt;
-    if (!st.glinted && remain <= a.parry && !a.breath) {
+    if (!st.glinted && remain <= a.parry && !a.noParry) {
       st.glinted = true;
       const [gx, gy] = enemySide(dir);
       FX.glint(gx, gy, 7, '#fff', 0.28);
@@ -436,28 +440,63 @@
 
   // Extra readability for the tell: a pulsing chevron on the attacking side.
   function drawTell() {
-    if (st.phase !== 'windup' || !st.windup) return;
+    if ((st.phase !== 'windup' || !st.windup) && st.phase !== 'between') return;
+    drawGuardZones();
+    if (!st.windup) return;
     const dir = st.pose.dir;
-    const [sx, sy] = enemySide(dir);
     const pulse = Math.floor(App.t * 10) & 1;
-    const col = pulse ? '#f65' : '#fd5';
-    // chevrons sit just outside the sprite so they never vanish into wings or fur
-    const d = enemyDef(), [ex0, ey0] = enemyOrigin();
-    const midY = ey0 + Math.round(d.h * 0.35);
-    const gx = dir < 0 ? Math.max(8, ex0 - 4) : dir > 0 ? Math.min(L.w - 8, ex0 + d.w + 4) : ex0 + (d.w >> 1);
-    const gy = dir === 0 ? Math.max(L.stageY + 20, ey0 - 4) : midY;
-    const glyph = dir < 0 ? '◀' : dir > 0 ? '▶' : '▲';
-    if (S.settings.assist || d.w >= 120) F.big(glyph, gx, gy - 6, { scale: 2, ramp: pulse ? 'gold' : 'fire', align: 'center' });
-    else F.draw(glyph, gx, gy, pulse ? '#fff' : col, { align: 'center', outline: '#000' });
-    void sx; void sy;
+    // Block Assist only: arrows just outside the sprite. Otherwise you read the monster.
+    if (S.settings.assist) {
+      const d = enemyDef(), [ex0, ey0] = enemyOrigin();
+      const gx = dir < 0 ? Math.max(8, ex0 - 4) : dir > 0 ? Math.min(L.w - 8, ex0 + d.w + 4) : ex0 + (d.w >> 1);
+      const gy = dir === 0 ? Math.max(L.stageY + 20, ey0 - 4) : ey0 + Math.round(d.h * 0.35);
+      F.big(dir < 0 ? '◀' : dir > 0 ? '▶' : '▲', gx, gy - 6, { scale: 2, ramp: pulse ? 'gold' : 'fire', align: 'center' });
+    }
     // coaching for brand-new players: the first few attacks are spelled out
     if ((S.stats.blocks || 0) + (S.stats.parries || 0) < 3 && (S.stats.fights || 0) <= 3) {
-      const side = dir < 0 ? 'from the LEFT: tap ◀' : dir > 0 ? 'from the RIGHT: tap ▶' : 'from ABOVE: tap ▲';
-      const txt = `It attacks ${side}`;
+      const side = dir < 0 ? 'the LEFT: tap left of your hero' : dir > 0 ? 'the RIGHT: tap right of your hero' : 'ABOVE: tap above your hero';
       const ty = L.stageY + 24;
       G.dither(0, ty - 3, L.w, 14, null, '#000', 11);
-      F.draw(txt, L.w >> 1, ty, pulse ? '#fd5' : '#ffe', { align: 'center', shadow: true });
+      F.draw(`It attacks from ${side}`, L.w >> 1, ty, pulse ? '#fd5' : '#ffe', { align: 'center', shadow: true });
     }
+  }
+
+  // The three guard zones around the hero, and the timing bar between hero and foe.
+  const zoneCentre = d => (d < 0 ? [Math.round(L.w * 0.17), L.stageB - 30] : d > 0 ? [Math.round(L.w * 0.83), L.stageB - 30] : [L.w >> 1, L.stageB - 70]);
+  function drawGuardZones() {
+    const between = st.phase === 'between';
+    const guard = between ? st.preGuard : st.guard;
+    for (const d of [-1, 0, 1]) {
+      const [zx, zy] = zoneCentre(d);
+      const on = guard === d;
+      const r = on ? 14 : 12;
+      G.dither(zx - r, zy - r, r * 2, r * 2, null, on ? '#a70' : '#000', on ? 10 : 7);
+      G.frame(zx - r, zy - r, r * 2, r * 2, on ? '#fe6' : '#889');
+      G.frame(zx - r + 1, zy - r + 1, r * 2 - 2, r * 2 - 2, on ? '#c92' : '#334');
+      F.big(d < 0 ? '◀' : d > 0 ? '▶' : '▲', zx + 1, zy - 7, { scale: 2, ramp: on ? 'gold' : 'stone', align: 'center' });
+    }
+    // timing bar
+    const bw = Math.min(150, L.w - 80), bx = (L.w - bw) >> 1, by = L.stageB - 92;
+    G.rect(bx - 1, by - 1, bw + 2, 9, '#000');
+    G.rect(bx, by, bw, 7, '#112');
+    if (between || !st.windup) {
+      F.draw('IT STRIKES AGAIN!', L.w >> 1, by - 11, P.c.orange, { align: 'center', outline: '#000' });
+      return;
+    }
+    const a = st.windup;
+    const prog = C.tempo(a.tempo, st.wt / a.windup);
+    if (!a.noParry) {
+      const pz = Math.round(bw * C.tempo(a.tempo, (a.windup - a.parry) / a.windup));
+      G.rect(bx + pz, by, bw - pz, 7, '#530');
+      G.dither(bx + pz, by, bw - pz, 7, null, '#a70', 8);
+    }
+    const inZone = !a.noParry && a.windup - st.wt <= a.parry;
+    const fill = Math.round(bw * prog);
+    G.rect(bx, by + 1, fill, 5, inZone ? '#fe6' : a.noParry ? '#e70' : '#d33');
+    G.rect(bx, by + 1, fill, 1, inZone ? '#ffb' : '#f98');
+    G.rect(bx + fill, by - 1, 1, 9, '#fff');
+    const label = a.noParry ? 'BLOCK IT — NO PARRY!' : inZone ? 'NOW — PARRY!' : a.tempo === 'stutter' && prog === 0.55 ? 'wait for it...' : '';
+    if (label) F.draw(label, L.w >> 1, by - 11, inZone ? P.c.gold : P.c.text, { align: 'center', outline: '#000' });
   }
 
   function drawHero() {
@@ -593,43 +632,18 @@
     if (UI.button('m-back', 8, my + mh - 26, w - 16, 22, 'BACK', { key: 'Escape', sound: 'back' })) st.menu = null;
   }
 
+  // During a wind-up the action panel becomes a hint; the guard is set by tapping
+  // the left, middle (above the hero) or right third of the screen below the
+  // enemy plate, or with the arrow keys.
   function drawBlockPad(y, h) {
     const w = L.w;
-    const a = st.windup || { windup: 1, parry: 0, breath: false, between: true };
-    if (a.between) st.wt = 0;
-    // timer bar with the parry zone at the end
-    const bx = 6, bw = w - 12, by = y + 4;
-    const remain = Math.max(0, a.windup - st.wt);
-    // time runs left → right; the parry zone waits at the right-hand end
-    G.rect(bx, by, bw, 6, '#000');
-    const inner = bw - 2;
-    const pz = Math.round(inner * a.parry / a.windup);
-    G.rect(bx + 1 + inner - pz, by + 1, pz, 4, a.breath ? '#334' : '#530');
-    G.dither(bx + 1 + inner - pz, by + 1, pz, 4, null, a.breath ? '#556' : '#a70', 8);
-    const fill = Math.round(inner * Math.min(1, st.wt / a.windup));
-    G.rect(bx + 1, by + 1, fill, 4, remain <= a.parry && !a.breath ? '#fe6' : '#d33');
-    G.rect(bx + fill, by, 1, 6, '#fff');
-    F.draw(a.between ? 'IT STRIKES AGAIN — GUARD!' : a.breath ? 'BREATH! block it — it cannot be parried' : remain <= a.parry ? 'NOW — PARRY!' : 'BLOCK THE ATTACK', w >> 1, by + 8, remain <= a.parry && !a.breath ? P.c.gold : P.c.text, { align: 'center', shadow: true });
-    const pad = 5, gap = 4, top = by + 19;
-    const bh = y + h - top - pad;
-    const cw = Math.floor((w - pad * 2 - gap * 2) / 3);
-    const dirs = [[-1, '◀ LEFT', ['ArrowLeft', 'a']], [0, '▲ HIGH', ['ArrowUp', 'w', ' ']], [1, 'RIGHT ▶', ['ArrowRight', 'd']]];
-    dirs.forEach(([d, label, keys], i) => {
-      const x = pad + i * (cw + gap);
-      const hint = S.settings.assist && d === st.pose.dir;
-      const on = a.between ? st.preGuard === d : st.guard === d;
-      UI.button('blk' + d, x, top, cw, bh, label, { theme: on ? 'gold' : hint && !a.between ? 'red' : 'steel', sound: false });
-      // react on touch-down, not release: blocking must be instant. Each press re-times the guard.
-      if (UI.enabled && UI.pointer.pressed && UI.active === 'blk' + d) setGuard(d);
-      if (keys.some(k => UI.key(k))) setGuard(d);
-    });
-    // swipes on the stage count as soon as the finger has travelled, not on lift
+    G.dither(0, y, w, h, null, '#000', 8);
+    F.draw('BLOCK: tap LEFT · ABOVE · RIGHT', w >> 1, y + Math.floor(h / 2) - 9, P.c.gold, { align: 'center', shadow: true });
+    F.draw('of your hero (or use ← ↑ →)', w >> 1, y + Math.floor(h / 2) + 3, P.c.dim, { align: 'center', shadow: true });
+    for (let i = 1; i < 3; i++) G.vline(Math.round(w * i / 3), y + 6, y + h - 6, '#334');
     const pt = UI.pointer;
-    if (!pt.down) st.swiped = false;
-    else if (UI.enabled && !st.swiped && pt.moved >= 12 && pt.sy >= L.stageY && pt.sy < L.stageB) {
-      const dx = pt.x - pt.sx, dy = pt.y - pt.sy;
-      if (Math.abs(dx) > Math.abs(dy)) { st.swiped = true; setGuard(dx < 0 ? -1 : 1); }
-      else if (dy < 0) { st.swiped = true; setGuard(0); }
-    }
+    if (UI.enabled && pt.pressed && pt.y >= L.stageY) setGuard(pt.x < w / 3 ? -1 : pt.x >= w * 2 / 3 ? 1 : 0);
+    const keys = [[-1, ['ArrowLeft', 'a']], [0, ['ArrowUp', 'w', ' ']], [1, ['ArrowRight', 'd']]];
+    for (const [d, ks] of keys) if (ks.some(k => UI.key(k))) setGuard(d);
   }
 })();
