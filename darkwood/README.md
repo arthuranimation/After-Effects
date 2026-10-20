@@ -25,16 +25,16 @@ saves from Darkwood 8.0 are migrated.
     other triple ×3, two crowns ×1.5, and a pair returns your stake.
 - **Combat:** the turn strip shows who acts next; faster fighters act more often.
   - **Your turn:** Attack, use Skills (MP), use Items, or Flee.
-  - **Blocking:** when a monster winds up, watch which side it raises its
-    weapon or claw on and guard that side: tap the battle **left of your hero,
-    above your hero, or right of your hero** (the left, middle and right
-    thirds of the screen), or use the arrow keys. A block cuts the damage by
-    80% and gives you 1 MP.
-  - **Parrying:** block at the last moment, when the glint flashes and the
-    timing bar above your hero reaches the gold zone. A parry stops all the
-    damage, gives you 2 MP and lets you act sooner.
+  - **Blocking:** when a monster winds up, it draws back and raises its
+    weapon or claw on one side. Guard that side by tapping the **left side**
+    of the screen, **your hero** (for attacks from above) or the **right
+    side**, or use the arrow keys. There are no markers: you read the
+    monster. A block cuts the damage by 80% and gives you 1 MP.
+  - **Parrying:** block at the last moment, when its weapon **gleams**, just
+    before it lurches forward. A parry stops all the damage, gives you 2 MP
+    and lets you act sooner.
   - **Attack styles:** every monster has its own moves, named as they wind up.
-    *Lunges* creep, then snap forward (the bar speeds up). *Delayed* swings stop
+    *Lunges* draw back slowly, then snap. *Delayed* swings freeze
     halfway to bait an early parry. *Heavy* blows are slow and hurt.
     *Flurries* are three quick strikes. *Jabs* are fast and light. Some foes
     *feint* (switch sides mid wind-up), and fire breath can be blocked but
